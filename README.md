@@ -21,14 +21,14 @@ A single LLM call is a guess. **Fleet is a system.**
 
 | | Single Ollama call | Fleet |
 |---|:---:|:---:|
-| **Opinions per prompt** | 1 | up to N models x M samples |
+| **Opinions per prompt** | 1 | up to 3 models × 5 samples (15 opinions) |
 | **Quality signal** | none | code execution / numeric vote / LLM judge |
 | **Wrong-answer detection** | none | calibrated abstention |
 | **Self-improvement** | none | Thompson-sampling bandit on outcomes |
 | **Refinement** | none | optional critique -> revise pass |
 | **Eval harness** | DIY | built-in, with regression gating |
 | **Privacy** | local | local |
-| **Cost** | one call | N x M calls (the trade) |
+| **Cost** | one call | up to 15 calls (the trade) |
 
 The trade: **per-prompt latency goes 5-20x and cost goes 10-50x, in exchange for measurably better answers.** If you want fast and cheap, this isn't it.
 
