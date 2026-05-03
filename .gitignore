@@ -2,3 +2,6 @@
 .worktrees/
 __pycache__/
 *.pyc
+
+# Claude Code per-session runtime state — must not be checked in.
+.claude/scheduled_tasks.lock
