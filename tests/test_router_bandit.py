@@ -95,6 +95,10 @@ async def test_bandit_persists_state(tmp_path):
     state = tmp_path / "bandit.json"
     config = _config_with_bandit(state_path=str(state))
     router = _ready_router(config)
+    # Persistence is debounced — force-flush after the single update so
+    # the next router can load it. Production CLI uses atexit; tests need
+    # an explicit sync point.
+    router._bandit._save_every = 1
 
     with patch.object(router._classifier, "classify", return_value=("math", 0.4)), \
          patch.object(router._dispatcher, "run_multi", new_callable=AsyncMock) as mock_multi, \

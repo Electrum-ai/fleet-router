@@ -187,7 +187,10 @@ class FleetRouter:
 
         # Refinement: critique → revise pass on the winning answer.
         if self._config.refinement.enabled and result.winner is not None:
-            refined = await self._refine(prompt, winner_text, system=system)
+            refined = await self._refine(
+                prompt, winner_text,
+                winner_model=result.winner.model, system=system,
+            )
             if refined:
                 return refined
 
@@ -206,9 +209,14 @@ class FleetRouter:
         return pool[:top_n]
 
     def _update_bandit(self, tag: str, result: VerificationResult) -> None:
-        """Push verifier scores into the bandit posteriors. No-op when
-        bandit disabled or when the verifier produced no scored candidates."""
-        if self._bandit is None or not result.all_scored:
+        """Push verifier scores into the bandit posteriors. Skipped when:
+        - bandit disabled, OR
+        - the verifier produced no scored candidates, OR
+        - the verifier marked its scores unreliable (judge crashed,
+          returned empty, output unparseable, or only one candidate).
+          Updating from those would poison posteriors with all-0.5 noise
+          and prevent the bandit from ever discriminating between models."""
+        if self._bandit is None or not result.all_scored or not result.scores_reliable:
             return
         for c in result.all_scored:
             self._bandit.update(tag, c.model, c.score)
@@ -233,8 +241,17 @@ class FleetRouter:
     async def _escalate(
         self, prompt: str, result, system: str | None = None
     ) -> str | None:
-        model = self._config.escalation.model
-        if not model:
+        configured_model = self._config.escalation.model
+        if not configured_model:
+            return None
+        candidate_models = {c.model for c in result.all_scored}
+        model = self._pick_arbiter(configured_model, candidate_models)
+        if model is None:
+            logger.info(
+                "escalation skipped: configured model %r is the only candidate "
+                "and no other model is available — self-judging would bias",
+                configured_model,
+            )
             return None
         # Show the top 3 candidates by score for arbitration.
         top = sorted(result.all_scored, key=lambda c: -c.score)[:3]
@@ -253,6 +270,23 @@ class FleetRouter:
         responses = await self._dispatcher.run(escalate_prompt, [model], system=system)
         return responses.get(model)
 
+    def _pick_arbiter(
+        self, configured: str, candidates: set[str]
+    ) -> Optional[str]:
+        """Pick a model to act as judge/critic/escalator that ISN'T already
+        a candidate. LLM judges have a well-documented self-preference
+        bias: when asked to rank answers including their own, they
+        consistently overrate themselves. If the configured arbiter is
+        in the candidate set, swap to the next-priority available model;
+        only return the configured model when no neutral alternative
+        exists (or when it isn't a candidate at all)."""
+        if configured not in candidates:
+            return configured
+        for alt in self._registry.all_available():
+            if alt not in candidates:
+                return alt
+        return None
+
     def _format_abstention(self, result, tag: str) -> str:
         """Calibrated 'I don't know' — surfaces the candidates so the user
         can judge for themselves rather than seeing a confident wrong answer."""
@@ -269,10 +303,22 @@ class FleetRouter:
         )
 
     async def _refine(
-        self, prompt: str, draft: str, system: str | None = None
+        self, prompt: str, draft: str, winner_model: Optional[str] = None,
+        system: str | None = None,
     ) -> str | None:
-        critique_model = self._config.refinement.critique_model
-        if not critique_model:
+        configured = self._config.refinement.critique_model
+        if not configured:
+            return None
+        # Critic should not be the same model that produced the draft —
+        # self-critique routinely returns "looks good" because the model
+        # rationalizes its own output. Swap to a different available model.
+        candidates = {winner_model} if winner_model else set()
+        critique_model = self._pick_arbiter(configured, candidates)
+        if critique_model is None:
+            logger.info(
+                "refinement skipped: configured critic %r wrote the draft "
+                "and no other model is available", configured,
+            )
             return None
         critique_prompt = (
             "Find errors, omissions, ambiguity, and weaknesses in this answer. "

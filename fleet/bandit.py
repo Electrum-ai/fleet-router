@@ -7,14 +7,21 @@ observed reward (mapped to {0, 1}). Persists to JSON if a state_path is set.
 Reward signal is the verifier/judge score from the synthesis pipeline —
 NOT latency or cost. The bandit learns "which model produces the best
 answer for this tag" over time.
+
+Persistence is debounced (one disk write per `save_every` updates) and
+serialized through a dedicated save lock so concurrent `update()` calls
+on the proxy's event loop don't race on the `.tmp` rename. A final
+flush runs at process exit so debounced state isn't lost.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import random
 import threading
+import uuid
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -28,6 +35,7 @@ class ThompsonBandit:
         state_path: Optional[str] = None,
         prior_alpha: float = 1.0,
         prior_beta: float = 1.0,
+        save_every: int = 25,
     ):
         # Expand ~ so configs like "~/.fleet/bandit.json" Just Work.
         self._state_path = os.path.expanduser(state_path) if state_path else None
@@ -35,7 +43,17 @@ class ThompsonBandit:
         self._prior_beta = prior_beta
         self._state: dict[str, dict[str, list[float]]] = {}
         self._lock = threading.Lock()
+        # Separate lock so the (potentially slow) disk write doesn't block
+        # readers/writers of the state dict — but is still serialized so
+        # two concurrent saves can't clobber each other on the .tmp rename.
+        self._save_lock = threading.Lock()
+        self._save_every = max(1, int(save_every))
+        self._pending_writes = 0
         self._load()
+        # Final flush at shutdown — debounced updates would otherwise be
+        # lost. Bound method ref keeps the bandit alive long enough.
+        if self._state_path:
+            atexit.register(self.flush)
 
     def _key(self, tag: str, model: str) -> tuple[str, str]:
         return tag, model
@@ -78,8 +96,9 @@ class ThompsonBandit:
     def update(self, tag: str, model: str, reward: float) -> None:
         """Update posterior. Reward ∈ [0, 1]. Treats reward as a Bernoulli
         outcome with that probability — fractional rewards split into
-        partial alpha/beta updates."""
+        partial alpha/beta updates. Writes are debounced — see save_every."""
         reward = max(0.0, min(1.0, float(reward)))
+        should_save = False
         with self._lock:
             tag_state = self._state.setdefault(tag, {})
             ab = tag_state.get(model)
@@ -88,6 +107,18 @@ class ThompsonBandit:
                 tag_state[model] = ab
             ab[0] += reward
             ab[1] += 1.0 - reward
+            self._pending_writes += 1
+            if self._pending_writes >= self._save_every:
+                self._pending_writes = 0
+                should_save = True
+        if should_save:
+            self._save()
+
+    def flush(self) -> None:
+        """Force any debounced writes to disk. Called from atexit and
+        available for callers that need a synchronization point."""
+        with self._lock:
+            self._pending_writes = 0
         self._save()
 
     def posterior_mean(self, tag: str, model: str) -> float:
@@ -119,13 +150,23 @@ class ThompsonBandit:
             logger.warning("bandit state load failed (%s); starting fresh", exc)
 
     def _save(self) -> None:
+        """Atomic, race-free disk save. The save lock serializes concurrent
+        writers; the unique tmp suffix means even pre-existing stale .tmp
+        files from a prior crash never collide with the current write."""
         if not self._state_path:
             return
-        try:
-            tmp_path = self._state_path + ".tmp"
-            os.makedirs(os.path.dirname(self._state_path) or ".", exist_ok=True)
-            with open(tmp_path, "w") as f:
-                json.dump(self.snapshot(), f, indent=2)
-            os.replace(tmp_path, self._state_path)
-        except OSError as exc:
-            logger.warning("bandit state save failed: %s", exc)
+        # Snapshot under the state lock — short critical section, then
+        # release before touching disk so updaters aren't blocked.
+        snapshot = self.snapshot()
+        with self._save_lock:
+            try:
+                # Unique tmp path per save call — defense in depth on top
+                # of the save_lock so a SIGKILL'd half-write can't get
+                # promoted to the canonical path by a later os.replace.
+                tmp_path = f"{self._state_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                os.makedirs(os.path.dirname(self._state_path) or ".", exist_ok=True)
+                with open(tmp_path, "w") as f:
+                    json.dump(snapshot, f, indent=2)
+                os.replace(tmp_path, self._state_path)
+            except OSError as exc:
+                logger.warning("bandit state save failed: %s", exc)

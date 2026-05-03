@@ -48,17 +48,36 @@ def _strip(text: str) -> str:
 
 
 def _extract_json(text: str) -> Optional[dict]:
-    """Best-effort: find the first JSON object in text and parse it."""
+    """Best-effort: find the first JSON object in text and parse it.
+
+    String-aware: braces inside double-quoted strings (e.g. a rationale
+    field that mentions `}`) are skipped so they don't unbalance the
+    depth counter and corrupt the slice. Without this, judge outputs
+    that include braces in their explanation silently fail to parse and
+    poison the bandit with the all-0.5 fallback path."""
     text = _strip(text)
     # Try whole text first (model followed instructions).
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
         pass
-    # Find a {...} block.
+    # Find a {...} block, ignoring braces inside string literals.
     depth = 0
     start = -1
+    in_string = False
+    escape = False
     for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
         if ch == "{":
             if depth == 0:
                 start = i
@@ -101,8 +120,14 @@ class JudgeVerifier:
         if not candidates:
             return VerificationResult(winner=None, all_scored=[], rationale="no candidates", abstain=True)
         if len(candidates) == 1:
+            # No judging happens — just pass it through. Mark unreliable
+            # so the bandit doesn't bias toward this model just because
+            # nobody else fielded a candidate this round.
             c = candidates[0].with_score(0.5, "only candidate; not judged")
-            return VerificationResult(winner=c, all_scored=[c], rationale="only candidate")
+            return VerificationResult(
+                winner=c, all_scored=[c], rationale="only candidate",
+                scores_reliable=False,
+            )
 
         rubric = _RUBRICS.get(self.tag, _RUBRICS["general"])
         labels = [chr(65 + i) for i in range(len(candidates))]  # A, B, C, ...
@@ -135,6 +160,7 @@ class JudgeVerifier:
                 winner=scored[0],
                 all_scored=scored,
                 rationale="judge unavailable; first candidate returned",
+                scores_reliable=False,
             )
 
         parsed = _extract_json(results[0])
@@ -145,6 +171,7 @@ class JudgeVerifier:
                 winner=scored[0],
                 all_scored=scored,
                 rationale="judge output unparseable; first candidate returned",
+                scores_reliable=False,
             )
 
         raw_scores = parsed.get("scores", {})

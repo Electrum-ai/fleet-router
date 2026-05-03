@@ -41,7 +41,8 @@ def test_rank_orders_models_by_draws():
 
 def test_persistence_round_trip(tmp_path):
     state = tmp_path / "bandit.json"
-    b = ThompsonBandit(state_path=str(state))
+    # save_every=1 disables debounce — every update writes immediately.
+    b = ThompsonBandit(state_path=str(state), save_every=1)
     b.update("math", "model-x", 1.0)
     b.update("math", "model-x", 0.0)
     b.update("math", "model-x", 1.0)
@@ -51,6 +52,54 @@ def test_persistence_round_trip(tmp_path):
     a, beta = b2._params("math", "model-x")
     assert a == 1.0 + 2  # prior + 2 successes
     assert beta == 1.0 + 1
+
+
+def test_debounce_skips_intermediate_writes(tmp_path):
+    """Default save_every (>1) means intermediate updates aren't on disk
+    until either the threshold is hit or flush() is called explicitly."""
+    state = tmp_path / "bandit.json"
+    b = ThompsonBandit(state_path=str(state), save_every=10)
+    for _ in range(5):
+        b.update("math", "m", 1.0)
+    # 5 < 10 → no save yet.
+    assert not state.exists()
+    b.flush()
+    assert state.exists()
+
+
+def test_concurrent_updates_no_state_corruption(tmp_path):
+    """Hammer update() from many threads at once. After all threads finish
+    + flush(), the on-disk state must (a) be valid JSON and (b) have the
+    correct cumulative alpha+beta given the inputs. Regression guard for
+    the .tmp-rename race the v1 save() had."""
+    import threading
+    state = tmp_path / "bandit.json"
+    b = ThompsonBandit(state_path=str(state), save_every=5)
+
+    n_threads = 20
+    updates_per_thread = 50
+
+    def worker():
+        for _ in range(updates_per_thread):
+            b.update("math", "m", 1.0)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    b.flush()
+
+    # Each update added 1.0 to alpha. Total: n_threads * updates_per_thread.
+    a, beta = b._params("math", "m")
+    assert a == 1.0 + n_threads * updates_per_thread
+    assert beta == 1.0  # no failures
+
+    # On-disk file must be parseable JSON, not a half-written .tmp clobber.
+    with open(state) as f:
+        loaded = json.load(f)
+    assert loaded["math"]["m"][0] == a
+    assert loaded["math"]["m"][1] == beta
 
 
 def test_load_handles_corrupt_state(tmp_path):

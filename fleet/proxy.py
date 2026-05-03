@@ -21,6 +21,7 @@ loops will not.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import time
@@ -38,6 +39,20 @@ logger = logging.getLogger(__name__)
 # Smaller = smoother UX, more events. 80 is a reasonable balance — Claude
 # Code's renderer batches deltas anyway.
 _STREAM_CHUNK_CHARS = 80
+
+# Heartbeat cadence while waiting for router.ask to complete. With max-quality
+# defaults a single prompt can run 30-90s (3 models × 7 samples + judge +
+# escalation + refinement); without heartbeats, Claude Code's HTTP client and
+# any intermediate proxy will time out the connection. Anthropic's spec allows
+# `ping` events at any time during a stream, which keeps the TCP connection
+# warm and signals to the SDK that the server is still working.
+_HEARTBEAT_INTERVAL_S = 5.0
+
+# Hard cap on a single prompt's wall-clock from the proxy's perspective. A
+# stuck Ollama call could otherwise hold a dispatcher slot indefinitely.
+# 10 minutes is generous for max-quality (refinement + escalation can be slow);
+# operators with tighter SLOs should override.
+_DEFAULT_PROMPT_DEADLINE_S = 600.0
 
 
 @dataclass
@@ -158,17 +173,13 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
 
 
-async def _stream_anthropic(
-    text: str, requested_model: str, message_id: str, prompt_tokens: int
-) -> AsyncIterator[bytes]:
-    """Emit the Anthropic streaming event sequence for a single text block.
-
-    Sequence: message_start → content_block_start → N×content_block_delta
-    → content_block_stop → message_delta → message_stop.
-    """
-    out_tokens = _approx_tokens(text)
-
-    yield _sse("message_start", {
+def _message_start_event(
+    requested_model: str, message_id: str, prompt_tokens: int
+) -> bytes:
+    """Pre-compute the message_start frame so the proxy can flush it
+    immediately on connection — before router.ask runs — to keep the SDK
+    from timing out the connection during the long synthesis phase."""
+    return _sse("message_start", {
         "type": "message_start",
         "message": {
             "id": message_id,
@@ -181,12 +192,24 @@ async def _stream_anthropic(
             "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
         },
     })
+
+
+def _ping_event() -> bytes:
+    return _sse("ping", {"type": "ping"})
+
+
+async def _stream_anthropic_body(text: str) -> AsyncIterator[bytes]:
+    """Emit the post-message_start sequence: content_block_start →
+    N×content_block_delta → content_block_stop → message_delta → message_stop.
+
+    Caller is responsible for emitting the message_start frame BEFORE
+    awaiting whatever produces `text` (so the connection stays warm)."""
+    out_tokens = _approx_tokens(text)
     yield _sse("content_block_start", {
         "type": "content_block_start",
         "index": 0,
         "content_block": {"type": "text", "text": ""},
     })
-
     for i in range(0, len(text), _STREAM_CHUNK_CHARS):
         chunk = text[i:i + _STREAM_CHUNK_CHARS]
         yield _sse("content_block_delta", {
@@ -194,7 +217,6 @@ async def _stream_anthropic(
             "index": 0,
             "delta": {"type": "text_delta", "text": chunk},
         })
-
     yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
     yield _sse("message_delta", {
         "type": "message_delta",
@@ -204,10 +226,17 @@ async def _stream_anthropic(
     yield _sse("message_stop", {"type": "message_stop"})
 
 
-def build_app(router: FleetRouter, *, api_key: Optional[str] = None) -> web.Application:
+def build_app(
+    router: FleetRouter,
+    *,
+    api_key: Optional[str] = None,
+    prompt_deadline_s: float = _DEFAULT_PROMPT_DEADLINE_S,
+) -> web.Application:
     """Construct the aiohttp app. `api_key`, if set, is required as the
     `x-api-key` header — basic guard against a stray local request hitting
-    your fleet from elsewhere on the network."""
+    your fleet from elsewhere on the network. `prompt_deadline_s` caps
+    how long a single /v1/messages request will wait for router.ask
+    before giving up and returning a structured error."""
     app = web.Application()
 
     async def healthz(_request: web.Request) -> web.Response:
@@ -217,7 +246,9 @@ def build_app(router: FleetRouter, *, api_key: Optional[str] = None) -> web.Appl
         if api_key:
             presented = request.headers.get("x-api-key") or request.headers.get("authorization", "")
             presented = presented.removeprefix("Bearer ").strip()
-            if presented != api_key:
+            # Constant-time compare so a network attacker on --host 0.0.0.0
+            # can't recover the key byte-by-byte from response timing.
+            if not hmac.compare_digest(presented, api_key):
                 raise web.HTTPUnauthorized(reason="invalid x-api-key")
 
         try:
@@ -234,24 +265,33 @@ def build_app(router: FleetRouter, *, api_key: Optional[str] = None) -> web.Appl
             parsed.requested_model, parsed.stream, len(parsed.prompt),
         )
 
-        try:
-            answer = await router.ask(parsed.prompt, system=parsed.system)
-        except Exception as exc:  # noqa: BLE001 — surface any router failure as 500
-            logger.exception("router.ask failed")
-            raise web.HTTPInternalServerError(
-                reason=f"router error: {type(exc).__name__}: {exc}"
-            )
-
-        # Router can return dict[model -> text] when caller forces parallel,
-        # but our /v1/messages path never forces it. Defensive flatten.
-        if isinstance(answer, dict):
-            answer = "\n\n".join(f"--- {m} ---\n{t}" for m, t in answer.items())
-
+        # Non-streaming path: nothing to keep alive, just await + JSON respond.
         if not parsed.stream:
+            try:
+                answer = await asyncio.wait_for(
+                    router.ask(parsed.prompt, system=parsed.system),
+                    timeout=prompt_deadline_s,
+                )
+            except asyncio.TimeoutError:
+                raise web.HTTPGatewayTimeout(
+                    reason=f"router.ask exceeded {prompt_deadline_s}s deadline"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("router.ask failed")
+                raise web.HTTPInternalServerError(
+                    reason=f"router error: {type(exc).__name__}: {exc}"
+                )
+            if isinstance(answer, dict):
+                answer = "\n\n".join(f"--- {m} ---\n{t}" for m, t in answer.items())
             return web.json_response(_build_message_response(
                 answer, parsed.requested_model, message_id, prompt_tokens,
             ))
 
+        # Streaming path: open SSE BEFORE awaiting router.ask, send
+        # message_start immediately, then ping every _HEARTBEAT_INTERVAL_S
+        # while the synthesis pipeline runs. Without this the connection
+        # appears dead for 30-90s under max-quality defaults — Claude Code
+        # / proxies / load balancers will time it out.
         resp = web.StreamResponse(
             status=200,
             headers={
@@ -261,9 +301,52 @@ def build_app(router: FleetRouter, *, api_key: Optional[str] = None) -> web.Appl
             },
         )
         await resp.prepare(request)
-        async for chunk in _stream_anthropic(
-            answer, parsed.requested_model, message_id, prompt_tokens
-        ):
+        await resp.write(_message_start_event(
+            parsed.requested_model, message_id, prompt_tokens,
+        ))
+
+        ask_task = asyncio.create_task(
+            router.ask(parsed.prompt, system=parsed.system)
+        )
+        deadline = asyncio.get_event_loop().time() + prompt_deadline_s
+        try:
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    ask_task.cancel()
+                    raise asyncio.TimeoutError(
+                        f"router.ask exceeded {prompt_deadline_s}s deadline"
+                    )
+                tick = min(_HEARTBEAT_INTERVAL_S, remaining)
+                try:
+                    # Race the synthesis task against the heartbeat tick.
+                    # asyncio.shield prevents the wait_for timeout from
+                    # cancelling ask_task — we only want the wait to expire.
+                    answer = await asyncio.wait_for(
+                        asyncio.shield(ask_task), timeout=tick,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    if ask_task.done():
+                        # The shield consumed our wait window AND the task
+                        # finished — pull its result on the next loop iter.
+                        continue
+                    await resp.write(_ping_event())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("router.ask failed mid-stream")
+            # Surface the failure as a text block + clean stream close.
+            # We can't switch to HTTP 500 once headers are out — the SDK
+            # would see a half-stream and treat it as a network error,
+            # which is worse than a structured error message.
+            err_text = f"(router error: {type(exc).__name__}: {exc})"
+            async for chunk in _stream_anthropic_body(err_text):
+                await resp.write(chunk)
+            await resp.write_eof()
+            return resp
+
+        if isinstance(answer, dict):
+            answer = "\n\n".join(f"--- {m} ---\n{t}" for m, t in answer.items())
+        async for chunk in _stream_anthropic_body(answer):
             await resp.write(chunk)
         await resp.write_eof()
         return resp

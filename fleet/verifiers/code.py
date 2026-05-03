@@ -110,36 +110,74 @@ class CodeVerifier:
         except (RecursionError, MemoryError):
             return candidate.with_score(0.0, "parse exhausted resources")
 
-        score = 0.5  # parses
-        notes_parts = ["parses"]
-
-        defined = sum(1 for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
-        if defined:
-            score += 0.15
-            notes_parts.append(f"defines {defined} symbol(s)")
-
-        has_doc = ast.get_docstring(tree) is not None or any(
-            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            and ast.get_docstring(n) is not None
-            for n in ast.walk(tree)
-        )
-        if has_doc:
-            score += 0.05
-            notes_parts.append("documented")
-
         dangerous, why = _has_dangerous_pattern(tree)
         if dangerous:
-            notes_parts.append(f"unsafe ({why}); not executing")
-            return candidate.with_score(min(score, 0.5), "; ".join(notes_parts))
+            return candidate.with_score(0.5, f"parses; unsafe ({why}); not executing")
 
+        # Distributed scoring when execution is OFF (the default). The
+        # previous implementation gave all-parse-with-defs candidates the
+        # same ~0.7 score, which (a) collapsed bandit signal and (b) sat
+        # exactly above the escalation threshold so EVERY code prompt
+        # triggered escalation. Spreading multiple weak signals across
+        # 0.50–0.85 lets candidates differentiate while keeping room for
+        # an "executes cleanly" candidate to win at 1.0 when execute=True.
         if not self._execute:
-            return candidate.with_score(score, "; ".join(notes_parts))
+            score, notes = self._distributed_static_score(tree, code)
+            return candidate.with_score(score, notes)
 
         # Execution gate — runs in a subprocess with timeout.
         exec_score, exec_note = await self._try_execute(code)
-        score = max(score, exec_score)
-        notes_parts.append(exec_note)
-        return candidate.with_score(min(score, 1.0), "; ".join(notes_parts))
+        # When execution is on, parse-only signals are noise; trust the
+        # execution outcome.
+        return candidate.with_score(exec_score, f"parses; {exec_note}")
+
+    def _distributed_static_score(self, tree: ast.AST, code: str) -> tuple[float, str]:
+        """0.50 base for parsing, +0.05 per discriminating signal, capped
+        at 0.85 so an executes-cleanly candidate can still beat any
+        static winner. Goal: spread candidates across the score range so
+        the bandit gets real signal AND escalation only fires for
+        genuine uncertainty (not on every code prompt)."""
+        signals: list[str] = []
+
+        nodes = list(ast.walk(tree))
+        defs = [n for n in nodes if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+
+        if defs:
+            signals.append(f"defines {len(defs)} symbol(s)")
+        if ast.get_docstring(tree) is not None or any(
+            ast.get_docstring(d) is not None for d in defs
+        ):
+            signals.append("documented")
+        # Type hints — strong correlation with intentional, careful code.
+        if any(
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (n.returns is not None
+                 or any(a.annotation is not None for a in n.args.args))
+            for n in nodes
+        ):
+            signals.append("typed")
+        # Has at least one return — distinguishes "function with body"
+        # from "function with pass".
+        if any(isinstance(n, ast.Return) and n.value is not None for n in nodes):
+            signals.append("returns value")
+        # Self-tests / assertions — strong intentionality signal.
+        if any(isinstance(n, ast.Assert) for n in nodes):
+            signals.append("self-tests")
+        # Pass-only body is a near-certain non-answer.
+        non_trivial = not all(
+            len(d.body) == 1 and isinstance(d.body[0], ast.Pass)
+            for d in defs
+        ) if defs else True
+        if non_trivial:
+            signals.append("non-trivial body")
+        # Reasonable line count — too short = stub, too long = noise.
+        line_count = code.count("\n") + 1
+        if 3 <= line_count <= 200:
+            signals.append("reasonable length")
+
+        score = 0.50 + 0.05 * len(signals)
+        score = min(score, 0.85)
+        return score, "; ".join(["parses", *signals])
 
     async def _try_execute(self, code: str) -> tuple[float, str]:
         path: str = ""

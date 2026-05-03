@@ -25,11 +25,18 @@ class VerificationResult:
     `abstain=True` signals "no candidate is good enough — return uncertainty
     structure instead of guessing." Callers (router) can choose to honor it
     or escalate to a stronger model with all candidates as context.
+
+    `scores_reliable=False` means the verifier returned scores but they're
+    fallback/error values, not real quality signals — typically when the
+    judge model crashed, returned empty, or produced unparseable output.
+    Bandit must NOT update from unreliable scores or it will poison its
+    posteriors with judge-failure noise.
     """
     winner: Optional[Candidate]
     all_scored: list[Candidate]
     rationale: str = ""
     abstain: bool = False
+    scores_reliable: bool = True
 
     @property
     def winner_text(self) -> Optional[str]:

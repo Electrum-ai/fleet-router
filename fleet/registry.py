@@ -75,14 +75,20 @@ class ModelRegistry:
         candidates = self.models_for_tag(tag, top_n=1)
         return candidates[0] if candidates else None
 
+    def _is_cloud_model(self, name: str, entry) -> bool:
+        """Cloud models (e.g. deepseek-v4-pro:cloud) are hosted remotely and
+        never appear in the local Ollama /api/tags list — they should not be
+        filtered by local availability."""
+        return ":cloud" in (entry.api_model or name)
+
     def models_for_tag(self, tag: str, top_n: int | None = None) -> list[str]:
         """Return up to `top_n` available models matching a tag, sorted by
         ascending priority. Defaults to `config.thresholds.max_parallel`.
 
         Ollama-provider models are gated on the live `_available` set so we
         never dispatch to models that aren't actually installed. Hosted
-        providers (openai, anthropic, etc.) are trusted from config — there
-        is no per-account model list to gate against."""
+        providers (openai, anthropic, etc.) and cloud-tagged models are trusted
+        from config — there is no per-account model list to gate against."""
         self._ensure_refreshed()
         if top_n is None:
             top_n = self._config.thresholds.max_parallel
@@ -90,7 +96,7 @@ class ModelRegistry:
         for name, entry in self._config.models.items():
             if tag not in entry.tags:
                 continue
-            if entry.provider == "ollama" and name not in self._available:
+            if entry.provider == "ollama" and name not in self._available and not self._is_cloud_model(name, entry):
                 continue
             scored.append((name, entry.priority))
         scored.sort(key=lambda x: x[1])
@@ -105,13 +111,16 @@ class ModelRegistry:
     def all_available(self) -> list[str]:
         """List currently available models, sorted by configured priority
         (unknown models sort last alphabetically). Includes both Ollama
-        models that are actually installed AND non-Ollama configured models."""
+        models that are actually installed AND non-Ollama configured models
+        AND cloud-tagged Ollama models (hosted remotely)."""
         self._ensure_refreshed()
         configured = self._config.models
         ollama_installed = set(self._available)
         names: set[str] = set(ollama_installed)
         for name, entry in configured.items():
             if entry.provider != "ollama":
+                names.add(name)
+            elif self._is_cloud_model(name, entry):
                 names.add(name)
         return sorted(
             names,

@@ -12,10 +12,18 @@ from fleet.providers.base import GenerateRequest, ModelInfo
 logger = logging.getLogger(__name__)
 
 _MAX_RESPONSE_CHARS = 4 * 1024 * 1024
+# Default cap on simultaneous in-flight requests TO Ollama from this provider
+# instance. With max-quality defaults a single prompt can fan out to ~21
+# requests; under proxy load (10 concurrent /v1/messages) that's ~210
+# simultaneous connections, which Ollama (and the kernel's connection table)
+# will not handle gracefully. 16 is conservative; bump if your Ollama box is
+# beefy and you've seen you have headroom.
+_DEFAULT_MAX_CONCURRENT = 16
 
 
 class OllamaProvider:
-    """Provider backed by Ollama's /api/generate."""
+    """Provider backed by Ollama's /api/generate. One shared aiohttp session
+    + a concurrency semaphore — both critical under proxy load."""
 
     name = "ollama"
 
@@ -24,26 +32,63 @@ class OllamaProvider:
         base_url: str = "http://localhost:11434",
         timeout: int = 60,
         api_key: str = "",
+        max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
     ):
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._api_key = api_key
+        # Lazily constructed inside an async context so it binds to the
+        # right event loop. aiohttp sessions are loop-bound; constructing
+        # here in __init__ would crash if called from sync context (CLI).
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+        # Sentinel — actual Semaphore created lazily in the same async ctx
+        # as the session so they share one event loop.
+        self._max_concurrent = max(1, int(max_concurrent))
+        self._semaphore: Optional[asyncio.Semaphore] = None
 
     def _headers(self) -> dict[str, str]:
-        """Return request headers including Authorization when api_key is set."""
-        headers: dict[str, str] = {}
+        """Return request headers including Authorization when api_key is set.
+
+        Always include Accept: application/json — Ollama's cloud model path
+        requires it or returns {"error": "unauthorized"}."""
+        headers: dict[str, str] = {"Accept": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Lazy session init under a lock — first concurrent caller wins."""
+        if self._session is not None and not self._session.closed:
+            return self._session
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                timeout = aiohttp.ClientTimeout(total=self._timeout)
+                self._session = aiohttp.ClientSession(
+                    timeout=timeout, headers=self._headers(),
+                )
+            if self._semaphore is None:
+                self._semaphore = asyncio.Semaphore(self._max_concurrent)
+        return self._session
+
     async def generate(self, request: GenerateRequest) -> list[Optional[str]]:
         if request.samples < 1:
             return []
-        timeout = aiohttp.ClientTimeout(total=self._timeout)
-        headers = self._headers()
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            tasks = [self._one_sample(session, request) for _ in range(request.samples)]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        session = await self._get_session()
+        # Semaphore acquired per sample (not per generate call) — the bound
+        # is on simultaneous HTTP requests to Ollama, regardless of whether
+        # they belong to the same prompt or different ones. This is what
+        # keeps 10 concurrent proxy clients from issuing 210 simultaneous
+        # connections.
+        sem = self._semaphore
+        assert sem is not None  # _get_session always sets it
+
+        async def _bounded_one():
+            async with sem:
+                return await self._one_sample(session, request)
+
+        tasks = [_bounded_one() for _ in range(request.samples)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[Optional[str]] = []
         for r in results:
             if isinstance(r, BaseException):
@@ -101,6 +146,8 @@ class OllamaProvider:
             return None
 
     async def list_models(self) -> list[ModelInfo]:
+        # list_models is rare (startup + occasional refresh) — it gets its
+        # own short-timeout session so a hung shared session can't block it.
         timeout = aiohttp.ClientTimeout(total=5)
         headers = self._headers()
         try:
@@ -122,4 +169,9 @@ class OllamaProvider:
         return models
 
     async def aclose(self) -> None:
-        return None
+        """Close the shared aiohttp session. Safe to call multiple times.
+        For the proxy: registered as a cleanup so a SIGTERM doesn't leak
+        keepalive connections to Ollama."""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None

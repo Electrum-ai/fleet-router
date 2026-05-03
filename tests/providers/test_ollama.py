@@ -105,12 +105,15 @@ async def test_ollama_list_models_handles_errors():
 
 def test_ollama_headers_with_api_key():
     p = OllamaProvider(api_key="sk-secret")
-    assert p._headers() == {"Authorization": "Bearer sk-secret"}
+    assert p._headers() == {
+        "Accept": "application/json",
+        "Authorization": "Bearer sk-secret",
+    }
 
 
 def test_ollama_headers_without_api_key():
     p = OllamaProvider(api_key="")
-    assert p._headers() == {}
+    assert p._headers() == {"Accept": "application/json"}
 
 
 @pytest.mark.asyncio

@@ -184,3 +184,35 @@ def test_refresh_no_api_key_no_auth_header(mock_get):
     call_kwargs = mock_get.call_args.kwargs
     assert call_kwargs.get("headers") == {}
     assert reg._available == {"glm-5.1"}
+
+
+def test_cloud_models_not_filtered_by_local_availability():
+    """Cloud models (e.g. deepseek-v4-pro:cloud) are hosted remotely and do
+    not appear in the local Ollama /api/tags list — they must still be
+    selectable for dispatch."""
+    config = Config(models={
+        "deepseek-v4-pro": ModelEntry(tags=["code"], priority=1, api_model="deepseek-v4-pro:cloud"),
+        "glm-5.1": ModelEntry(tags=["creative"], priority=2),
+    })
+    reg = ModelRegistry(config)
+    reg._available = {"glm-5.1"}  # local Ollama only knows about glm
+
+    # Cloud model should be available even though not in local tags
+    assert reg.models_for_tag("code") == ["deepseek-v4-pro"]
+    # Local model still works
+    assert reg.models_for_tag("creative") == ["glm-5.1"]
+
+
+def test_cloud_models_in_all_available():
+    """Cloud models should appear in all_available even when local Ollama
+    returns an empty model list."""
+    config = Config(models={
+        "deepseek-v4-pro": ModelEntry(tags=["code"], priority=1, api_model="deepseek-v4-pro:cloud"),
+        "glm-5.1": ModelEntry(tags=["creative"], priority=2),
+    })
+    reg = ModelRegistry(config)
+    reg._available = set()  # empty local registry
+
+    names = reg.all_available()
+    assert "deepseek-v4-pro" in names
+    assert "glm-5.1" not in names  # local model filtered out
