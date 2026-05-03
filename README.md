@@ -438,7 +438,7 @@ fleet-router/
 │   ├── compare.py             # side-by-side router comparison
 │   ├── scorers/               # code-exec, numeric, multi-choice, keyword
 │   └── fixtures/              # easy + hard JSONL sets
-└── tests/                     # 189 tests across 24 files
+└── tests/                     # 213 tests across 25 files
 ```
 
 ---
