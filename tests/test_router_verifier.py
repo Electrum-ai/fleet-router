@@ -167,3 +167,135 @@ async def test_refinement_skipped_on_no_critique_needed():
     # Only the critique call was made; no revise call because critic said it was fine.
     assert result == "good draft"
     assert mock_run.await_count == 1
+
+
+# ---------- self-judge bias regression guards (audit finding #4) ----------
+
+
+def test_pick_arbiter_returns_configured_when_not_a_candidate():
+    """If the configured arbiter wasn't dispatched as a candidate, no
+    rotation needed — return it as-is."""
+    config = Config(
+        models={"a": ModelEntry(tags=["math"]), "b": ModelEntry(tags=["math"])},
+    )
+    router = FleetRouter(config)
+    router._registry._available = {"a", "b", "judge"}
+    router._registry._refreshed = True
+
+    assert router._pick_arbiter("judge", {"a", "b"}) == "judge"
+
+
+def test_pick_arbiter_rotates_to_neutral_alt_when_configured_is_candidate():
+    """If the configured arbiter ALSO appears in the candidate set, swap
+    to a different available model. Self-judging is a documented LLM
+    bias — judges over-rate their own outputs."""
+    config = Config(
+        models={
+            "a": ModelEntry(tags=["math"]),
+            "b": ModelEntry(tags=["math"]),
+            "neutral": ModelEntry(tags=["math"]),
+        },
+    )
+    router = FleetRouter(config)
+    router._registry._available = {"a", "b", "neutral"}
+    router._registry._refreshed = True
+
+    # configured="a" is a candidate; "neutral" is the only non-candidate.
+    assert router._pick_arbiter("a", {"a", "b"}) == "neutral"
+
+
+def test_pick_arbiter_returns_none_when_no_neutral_alt():
+    """If the configured arbiter is in the candidate set AND there's no
+    other available model, refuse to escalate/refine — better to skip
+    than to ask a candidate to judge itself."""
+    config = Config(models={"a": ModelEntry(tags=["math"])})
+    router = FleetRouter(config)
+    router._registry._available = {"a"}
+    router._registry._refreshed = True
+
+    assert router._pick_arbiter("a", {"a"}) is None
+
+
+@pytest.mark.asyncio
+async def test_escalation_swaps_away_from_self_judging_candidate():
+    """End-to-end: when the configured escalator IS one of the candidates,
+    the actual call must go to a NON-candidate model (or be skipped)."""
+    config = Config(
+        models={
+            "alpha": ModelEntry(tags=["math"], priority=1),
+            "beta": ModelEntry(tags=["math"], priority=2),
+            "gamma": ModelEntry(tags=["math"], priority=3),
+        },
+        synthesis=SynthesisConfig(mode="verifier"),
+        sampling=SamplingConfig(samples_by_tag={"math": 1, "default": 1}),
+        # Escalator "alpha" will also be dispatched as a candidate (max_parallel=3).
+        escalation=EscalationConfig(enabled=True, model="alpha", score_threshold=0.6),
+    )
+    router = FleetRouter(config)
+    router._registry._available = {"alpha", "beta", "gamma"}
+    router._registry._refreshed = True
+
+    with patch.object(router._classifier, "classify", return_value=("math", 0.4)), \
+         patch.object(router._dispatcher, "run_multi", new_callable=AsyncMock) as mock_multi, \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_run, \
+         patch.object(router._verifier_synth, "pick", new_callable=AsyncMock) as mock_pick:
+        mock_multi.return_value = {"alpha": ["1"], "beta": ["2"], "gamma": ["3"]}
+        mock_pick.return_value = VerificationResult(
+            winner=None,
+            all_scored=[
+                Candidate("alpha", 0, "1", score=0.2),
+                Candidate("beta", 0, "2", score=0.2),
+                Candidate("gamma", 0, "3", score=0.2),
+            ],
+            abstain=True,
+        )
+        # No candidate for escalator — there's no fourth model. Pick_arbiter
+        # should refuse, escalation skipped, abstention surfaced to user.
+        result = await router.ask("p")
+    # mock_run never called because escalation refused.
+    assert mock_run.await_count == 0
+    # Abstention path returned to user.
+    assert "uncertain" in result
+
+
+@pytest.mark.asyncio
+async def test_refinement_swaps_away_from_winning_model():
+    """When the winning model is also the configured critic, refinement
+    must rotate to a different model — not ask the winner to critique
+    its own answer."""
+    config = Config(
+        models={
+            "winner-and-critic": ModelEntry(tags=["general"], priority=1),
+            "neutral": ModelEntry(tags=["general"], priority=2),
+        },
+        synthesis=SynthesisConfig(mode="verifier"),
+        sampling=SamplingConfig(samples_by_tag={"default": 1}),
+        refinement=RefinementConfig(
+            enabled=True, critique_model="winner-and-critic",
+        ),
+    )
+    router = FleetRouter(config)
+    router._registry._available = {"winner-and-critic", "neutral"}
+    router._registry._refreshed = True
+
+    with patch.object(router._classifier, "classify", return_value=("general", 0.4)), \
+         patch.object(router._dispatcher, "run_multi", new_callable=AsyncMock) as mock_multi, \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_run, \
+         patch.object(router._verifier_synth, "pick", new_callable=AsyncMock) as mock_pick:
+        mock_multi.return_value = {"winner-and-critic": ["draft"]}
+        mock_pick.return_value = VerificationResult(
+            winner=Candidate("winner-and-critic", 0, "draft", score=0.8),
+            all_scored=[],
+        )
+        mock_run.side_effect = [
+            {"neutral": "missing X"},      # critique by neutral, not by winner
+            {"neutral": "draft plus X"},   # revise by neutral
+        ]
+        result = await router.ask("explain")
+    assert result == "draft plus X"
+    # BOTH dispatcher.run calls must have used "neutral", not "winner-and-critic".
+    for call in mock_run.call_args_list:
+        assert call[0][1] == ["neutral"], (
+            f"refinement called {call[0][1]}, but winner was the critic — "
+            "self-critique would bias toward 'looks good'"
+        )
