@@ -141,6 +141,68 @@ Exit codes: `0` success, `1` error, `2` sentinel error (e.g. no model available)
 
 ---
 
+## Use as a Claude Code backend
+
+Run **Claude Code with fleet → Ollama as its backend** instead of Anthropic. Fleet exposes an Anthropic Messages API-compatible HTTP proxy on `localhost`:
+
+```bash
+# 1. Start the proxy (defaults: 127.0.0.1:8765)
+fleet --serve --port 8765 --api-key fleet-local &
+
+# 2. Point Claude Code at it
+export ANTHROPIC_BASE_URL=http://localhost:8765
+export ANTHROPIC_API_KEY=fleet-local
+
+# 3. Use Claude Code as normal — every prompt routes through fleet → Ollama
+claude
+```
+
+### What works
+
+| Feature | Status |
+|---|:---:|
+| Plain chat (single + multi-turn) | ✅ |
+| System prompts | ✅ |
+| Streaming responses (SSE) | ✅ |
+| Verifier-driven synthesis on every turn | ✅ |
+| Bandit learning across sessions | ✅ |
+| `x-api-key` header guard | ✅ |
+| Tool use (`tool_use` / `tool_result` blocks) | ⚠️ flattened to text — agentic tool loops will not work |
+| Image / vision | ❌ text-only path |
+
+### Why the tool caveat?
+
+Anthropic's tool calling format does not map cleanly to Ollama's OpenAI-style function calling. Tool blocks in conversation history are flattened to readable text summaries so the model retains context, but it can't *issue* tool calls Claude Code will execute. Best for plain conversational use of `claude`; full agentic workflows still need Anthropic.
+
+### Endpoints
+
+- `POST /v1/messages` — Anthropic Messages API (streaming + non-streaming)
+- `GET  /healthz` — liveness probe
+
+> **Security:** the proxy binds to `127.0.0.1` by default (local only). If you set `--host 0.0.0.0`, **always** also set `--api-key` to prevent open access to your Ollama compute.
+
+### One-command toggle
+
+A ready-to-use shell helper ships at [`scripts/fleet-toggle.sh`](scripts/fleet-toggle.sh). Source it from your shell rc:
+
+```bash
+# in ~/.zshrc or ~/.bashrc
+source /path/to/fleet-router/scripts/fleet-toggle.sh
+```
+
+Then in any shell:
+
+```bash
+fleet-on      # boots proxy + sets ANTHROPIC_BASE_URL in this shell
+claude        # routes through fleet → Ollama
+fleet-status  # show proxy + env state
+fleet-off     # stop proxy + unset env vars; claude goes back to Anthropic
+```
+
+The proxy runs as a background process (PID file in `$TMPDIR`); env vars are scoped to the shell that ran `fleet-on`. Other shells default to Anthropic unless they also call `fleet-on`. Override the port with `FLEET_PORT=9000 fleet-on`.
+
+---
+
 ## Python API
 
 ```python

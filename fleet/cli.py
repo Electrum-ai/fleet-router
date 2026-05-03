@@ -1,8 +1,10 @@
 """CLI entrypoint for direct testing outside Claude Code.
 
-Subcommands:
+Modes:
 - (default) ask        — route a single prompt
-- eval                 — run the eval harness against the fixtures directory
+- --eval DIR           — run the eval harness against fixtures
+- --serve              — launch Anthropic-compatible HTTP proxy so Claude
+                         Code can use fleet → Ollama as its backend
 """
 from __future__ import annotations
 
@@ -39,6 +41,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--save-baseline", default=None, metavar="PATH",
         help="Eval mode only: save current aggregates as the new baseline",
+    )
+    parser.add_argument(
+        "--serve", action="store_true",
+        help="Launch Anthropic-compatible HTTP proxy (use with Claude Code)",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Serve mode: bind host (default 127.0.0.1 — local only)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8765,
+        help="Serve mode: bind port (default 8765)",
+    )
+    parser.add_argument(
+        "--api-key", default=None,
+        help="Serve mode: require this value as x-api-key header",
     )
     return parser
 
@@ -121,12 +139,27 @@ def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_serve(router: FleetRouter, args: argparse.Namespace) -> int:
+    # Lazy import — proxy module pulls in aiohttp.web, only needed here.
+    from fleet.proxy import serve
+
+    try:
+        serve(router, host=args.host, port=args.port, api_key=args.api_key)
+    except KeyboardInterrupt:
+        print("\nshutting down", file=sys.stderr)
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"fleet: serve failed — {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
+        level=logging.DEBUG if args.verbose else logging.INFO if args.serve else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
@@ -134,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config)
     router = FleetRouter(config)
 
+    if args.serve:
+        return _run_serve(router, args)
     if args.eval:
         return _run_eval(router, args)
     return _run_ask(router, args)
