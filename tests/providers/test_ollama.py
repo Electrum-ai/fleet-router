@@ -29,6 +29,7 @@ async def test_ollama_single_sample():
     with patch("aiohttp.ClientSession.post") as mock_post:
         _setup_post(mock_post, response_json={"response": "answer"})
         result = await p.generate(req)
+    await p.aclose()
     assert result == ["answer"]
 
 
@@ -40,6 +41,7 @@ async def test_ollama_multi_sample():
     with patch("aiohttp.ClientSession.post") as mock_post:
         _setup_post(mock_post, response_json={"response": "x"})
         result = await p.generate(req)
+    await p.aclose()
     assert len(result) == 3
     assert all(r == "x" for r in result)
     assert mock_post.call_count == 3
@@ -52,6 +54,7 @@ async def test_ollama_passes_temperature():
     with patch("aiohttp.ClientSession.post") as mock_post:
         _setup_post(mock_post)
         await p.generate(req)
+    await p.aclose()
     payload = mock_post.call_args.kwargs["json"]
     assert payload["options"]["temperature"] == 0.9
 
@@ -66,6 +69,7 @@ async def test_ollama_http_error_yields_none():
     with patch("aiohttp.ClientSession.post") as mock_post:
         _setup_post(mock_post, raise_for_status_error=err)
         result = await p.generate(req)
+    await p.aclose()
     assert result == [None]
 
 
@@ -74,7 +78,59 @@ async def test_ollama_zero_samples_returns_empty():
     p = OllamaProvider()
     req = GenerateRequest(model="glm", prompt="hi", samples=0)
     result = await p.generate(req)
+    await p.aclose()
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_ollama_session_reused_across_calls():
+    """Backpressure regression guard: the v1 provider opened a fresh session
+    per generate(). The new code reuses one session — verify that's true."""
+    p = OllamaProvider()
+    req = GenerateRequest(model="glm", prompt="hi")
+    with patch("aiohttp.ClientSession.post") as mock_post:
+        _setup_post(mock_post, response_json={"response": "ok"})
+        await p.generate(req)
+        first_session = p._session
+        await p.generate(req)
+        assert p._session is first_session
+    await p.aclose()
+    assert p._session is None  # closed
+
+
+@pytest.mark.asyncio
+async def test_ollama_semaphore_caps_concurrent_requests():
+    """With max_concurrent=2 and 5 samples, only 2 should be in flight at
+    any moment. The mock's __aenter__ holds briefly so peers pile up;
+    we measure peak concurrency observed inside __aenter__."""
+    p = OllamaProvider(max_concurrent=2)
+    req = GenerateRequest(model="glm", prompt="hi", samples=5)
+
+    in_flight = 0
+    peak = 0
+
+    async def aenter(_self=None):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.05)
+        in_flight -= 1
+        mock_response = AsyncMock()
+        mock_response.json = AsyncMock(return_value={"response": "ok"})
+        mock_response.raise_for_status = MagicMock()
+        return mock_response
+
+    def post_factory(*args, **kwargs):
+        cm = AsyncMock()
+        cm.__aenter__ = aenter
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    with patch("aiohttp.ClientSession.post", side_effect=post_factory):
+        await p.generate(req)
+    await p.aclose()
+    assert peak <= 2, f"semaphore should cap to 2 in-flight, saw {peak}"
+    assert peak >= 1  # sanity: at least one was in flight
 
 
 @pytest.mark.asyncio
@@ -124,6 +180,7 @@ async def test_ollama_generate_works_with_api_key():
     with patch("aiohttp.ClientSession.post") as mock_post:
         _setup_post(mock_post, response_json={"response": "ok"})
         result = await p.generate(req)
+    await p.aclose()
     assert result == ["ok"]
 
 

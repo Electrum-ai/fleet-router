@@ -1,6 +1,7 @@
 """Tests for fleet.proxy — Anthropic Messages API compatibility layer."""
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -21,14 +22,19 @@ from fleet.router import ERROR_ALL_MODELS_FAILED, ERROR_NO_MODEL
 class _StubRouter:
     """Stand-in for FleetRouter.ask — captures the prompt + system it saw."""
 
-    def __init__(self, answer: str = "hello back"):
+    def __init__(self, answer: str = "hello back", delay: float = 0.0):
         self._answer = answer
+        self._delay = delay
         self.last_prompt: str | None = None
         self.last_system: str | None = None
+        self.call_count = 0
 
     async def ask(self, prompt, *, force_parallel=False, force_model=None, system=None):
         self.last_prompt = prompt
         self.last_system = system
+        self.call_count += 1
+        if self._delay:
+            await asyncio.sleep(self._delay)
         return self._answer
 
 
@@ -602,3 +608,159 @@ async def test_v1_models_returns_registry_models():
     ids = [m["id"] for m in body["data"]]
     assert ids == ["deepseek-v4-pro", "glm-5.1"]
     assert all(m["object"] == "model" and m["owned_by"] == "fleet" for m in body["data"])
+
+
+# ---------- streaming heartbeat / deadline / concurrency ----------
+
+
+def _parse_sse_events(raw: str) -> list[tuple[str, dict]]:
+    """Parse an SSE byte stream into (event_name, data_dict) pairs."""
+    events: list[tuple[str, dict]] = []
+    current_event: str | None = None
+    for line in raw.splitlines():
+        if line.startswith("event: "):
+            current_event = line[len("event: "):].strip()
+        elif line.startswith("data: ") and current_event is not None:
+            try:
+                payload = json.loads(line[len("data: "):])
+            except json.JSONDecodeError:
+                payload = {}
+            events.append((current_event, payload))
+            current_event = None
+    return events
+
+
+@pytest.mark.asyncio
+async def test_streaming_emits_message_start_before_router_finishes():
+    """Regression guard for the v1 'fake streaming' bug — the v1 proxy
+    awaited router.ask() FULLY before opening SSE, so Claude Code saw
+    silence for the entire synthesis window. v2 must emit message_start
+    immediately and ping while waiting."""
+    # 1.5s delay: long enough that we'll see at least one ping at 5s
+    # heartbeat... too long for fast CI. Use shorter heartbeat for the
+    # test so we don't have to wait actual seconds.
+    import fleet.proxy as proxy_mod
+    original_heartbeat = proxy_mod._HEARTBEAT_INTERVAL_S
+    proxy_mod._HEARTBEAT_INTERVAL_S = 0.1
+    try:
+        router = _StubRouter("done", delay=0.35)  # ~3 ping cycles
+        app = build_app(router)  # type: ignore[arg-type]
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/v1/messages", json={
+                "model": "x",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            })
+            assert resp.status == 200
+            raw = (await resp.read()).decode("utf-8")
+    finally:
+        proxy_mod._HEARTBEAT_INTERVAL_S = original_heartbeat
+
+    events = _parse_sse_events(raw)
+    event_names = [name for name, _ in events]
+    assert event_names[0] == "message_start"
+    # At least one ping must have fired between message_start and the
+    # actual content — otherwise streaming is "fake" again.
+    assert "ping" in event_names, f"no heartbeat events; got {event_names}"
+    ping_idx = event_names.index("ping")
+    content_idx = event_names.index("content_block_start")
+    assert ping_idx < content_idx, "ping should fire BEFORE content arrives"
+    assert event_names[-1] == "message_stop"
+
+
+@pytest.mark.asyncio
+async def test_streaming_router_failure_yields_clean_stream_close():
+    """If router.ask raises after headers are out, we can't switch to a
+    500 — must surface the error inside the SSE body and close cleanly."""
+    class _BoomRouter:
+        async def ask(self, *args, **kwargs):
+            raise RuntimeError("ollama crashed mid-prompt")
+
+    app = build_app(_BoomRouter())  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/messages", json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        })
+        assert resp.status == 200
+        raw = (await resp.read()).decode("utf-8")
+
+    events = _parse_sse_events(raw)
+    names = [n for n, _ in events]
+    assert names[0] == "message_start"
+    assert names[-1] == "message_stop"
+    # The error text should be in a content_block_delta.
+    deltas = [
+        d["delta"]["text"] for n, d in events
+        if n == "content_block_delta" and d.get("delta", {}).get("type") == "text_delta"
+    ]
+    assert any("router error" in t and "ollama crashed mid-prompt" in t for t in deltas)
+
+
+@pytest.mark.asyncio
+async def test_prompt_deadline_non_streaming_returns_504():
+    """A router.ask that exceeds prompt_deadline_s on the non-streaming
+    path must surface as 504, not as a 60s+ silent hang."""
+    router = _StubRouter("never seen", delay=10.0)
+    app = build_app(router, prompt_deadline_s=0.2)  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/messages", json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status == 504
+
+
+@pytest.mark.asyncio
+async def test_prompt_deadline_streaming_closes_with_error_block():
+    """Streaming path: deadline exceeded should close cleanly with an
+    error message-block, not hang the connection."""
+    import fleet.proxy as proxy_mod
+    original_heartbeat = proxy_mod._HEARTBEAT_INTERVAL_S
+    proxy_mod._HEARTBEAT_INTERVAL_S = 0.05
+    try:
+        router = _StubRouter("never seen", delay=10.0)
+        app = build_app(router, prompt_deadline_s=0.2)  # type: ignore[arg-type]
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/v1/messages", json={
+                "model": "x",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            })
+            assert resp.status == 200
+            raw = (await resp.read()).decode("utf-8")
+    finally:
+        proxy_mod._HEARTBEAT_INTERVAL_S = original_heartbeat
+    events = _parse_sse_events(raw)
+    names = [n for n, _ in events]
+    assert names[0] == "message_start"
+    assert names[-1] == "message_stop"
+    # Error surfaces in the stream as text content.
+    deltas = [
+        d["delta"]["text"] for n, d in events
+        if n == "content_block_delta" and d.get("delta", {}).get("type") == "text_delta"
+    ]
+    joined = "".join(deltas)
+    assert "deadline" in joined.lower() or "timeout" in joined.lower()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_proxy_requests_all_complete():
+    """N parallel /v1/messages calls must all return their own answers
+    without any cross-talk or session reuse bugs."""
+    router = _StubRouter("answer", delay=0.05)
+    app = build_app(router)  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        async def one_request(i):
+            resp = await client.post("/v1/messages", json={
+                "model": "x",
+                "messages": [{"role": "user", "content": f"prompt {i}"}],
+            })
+            assert resp.status == 200
+            body = await resp.json()
+            return body["content"][0]["text"]
+
+        results = await asyncio.gather(*(one_request(i) for i in range(20)))
+    assert all(r == "answer" for r in results)
+    assert router.call_count == 20
