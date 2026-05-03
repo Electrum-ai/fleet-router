@@ -7,9 +7,10 @@
 *Quality-first. Not fastest. Not cheapest. **Best answer.***
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-189%20passing-2ea44f)](#testing)
+[![Tests](https://img.shields.io/badge/tests-213%20passing-2ea44f)](#testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Runtime: Ollama](https://img.shields.io/badge/runtime-Ollama-FF6B35?logo=ollama&logoColor=white)](https://ollama.com)
+[![Quality: Max by default](https://img.shields.io/badge/quality-max%20by%20default-blueviolet)](#quality-by-default)
 
 </div>
 
@@ -21,16 +22,23 @@ A single LLM call is a guess. **Fleet is a system.**
 
 | | Single Ollama call | Fleet |
 |---|:---:|:---:|
-| **Opinions per prompt** | 1 | up to 3 models × 5 samples (15 opinions) |
+| **Opinions per prompt** | 1 | 3 models × up to 7 samples (≈21 opinions) |
 | **Quality signal** | none | code execution / numeric vote / LLM judge |
 | **Wrong-answer detection** | none | calibrated abstention |
 | **Self-improvement** | none | Thompson-sampling bandit on outcomes |
-| **Refinement** | none | optional critique -> revise pass |
+| **Refinement** | none | critique → revise pass (default ON) |
+| **Disagreement arbitration** | none | escalation to strongest model (default ON) |
 | **Eval harness** | DIY | built-in, with regression gating |
 | **Privacy** | local | local |
-| **Cost** | one call | up to 15 calls (the trade) |
+| **Cost** | one call | up to ~25 calls per prompt (the trade) |
 
-The trade: **per-prompt latency goes 5-20x and cost goes 10-50x, in exchange for measurably better answers.** If you want fast and cheap, this isn't it.
+The trade: **per-prompt latency goes 10-30× and cost goes 20-80×, in exchange for measurably better answers.** If you want fast and cheap, this isn't it.
+
+### Quality by default
+
+Out of the box, every quality lever is ON: parallel ensemble, multi-sample self-consistency, verifier-driven scoring, LLM-as-judge, calibrated abstention, disagreement escalation, critique-and-revise refinement, and bandit learning. The only quality lever that ships OFF is `code_execute` — running LLM-generated code is a real RCE vector even with static safety checks, so opting in is a deliberate choice.
+
+To downshift (faster, cheaper, lower quality), opt out explicitly in `~/.fleet/config.yaml`. See [Configuration](#configuration).
 
 ---
 
@@ -235,11 +243,67 @@ print(report["summary"])
 
 ## Configuration
 
-Resolution order: explicit `--config` path -> `~/.fleet/config.yaml` -> bundled `fleet/config.yaml` -> built-in defaults.
+Resolution order: explicit `--config` path → `~/.fleet/config.yaml` → bundled `fleet/config.yaml` → built-in defaults.
+
+### The shipped defaults (max quality)
+
+```yaml
+thresholds:
+  single_confidence: 1.01       # >1 → every prompt fans out (always parallel)
+  parallel_timeout: 60
+  max_parallel: 3
+
+synthesis:
+  mode: verifier
+  judge_model: deepseek-v4-pro  # strongest model arbitrates judge-based tags
+  abstention_threshold: 0.4
+  code_execute: false           # OFF for security — opt in only if you trust the sandbox
+  code_execute_timeout: 5
+
+sampling:
+  samples_by_tag:
+    math: 7                     # Wang+ majority-vote sweet spot
+    reasoning: 5
+    code: 3                     # execution check is the strong signal
+    default: 3                  # everything else: 3 drafts for the judge
+  temperature: 0.7
+
+refinement:
+  enabled: true                 # critique → revise pass
+  critique_model: deepseek-v4-pro
+
+escalation:
+  enabled: true                 # arbitrate divergent answers via stronger model
+  model: deepseek-v4-pro
+  score_threshold: 0.6
+
+bandit:
+  enabled: true                 # outcome-driven Thompson sampling
+  state_path: ~/.fleet/bandit.json   # persists posteriors across runs
+```
+
+### Downshift recipe (faster, cheaper, less quality)
+
+Drop this in `~/.fleet/config.yaml` to flip every quality lever off:
+
+```yaml
+thresholds:
+  single_confidence: 0.8        # high-confidence classifications go single-model
+sampling:
+  samples_by_tag: { default: 1 }
+synthesis:
+  mode: heuristic               # length/AST picker, no judge calls
+refinement:   { enabled: false }
+escalation:   { enabled: false }
+bandit:       { enabled: false }
+```
+
+### Full schema
 
 ```yaml
 ollama:
   base_url: http://localhost:11434
+  api_key: ""                   # set when Ollama requires auth (e.g. cloud models)
 
 models:
   deepseek-v4-pro:
@@ -250,52 +314,18 @@ models:
   glm-5.1:
     tags: [creative, chinese, long_context]
     priority: 2
-  qwen-tiny:                    # small open-source model as judge / classifier
-    tags: [general]
-    priority: 9
-
-thresholds:
-  single_confidence: 0.8        # below -> parallel mode
-  parallel_timeout: 60          # seconds per dispatch
-  max_parallel: 3
+  # ... etc
 
 classifier:
   embeddings_model: all-MiniLM-L6-v2
   mode: keyword                 # "keyword" or "llm"
   llm_model: ""                 # set to an Ollama model when mode=llm
 
-synthesis:
-  mode: verifier                # "verifier" (default) or "heuristic"
-  judge_model: ""               # set to e.g. "qwen-tiny" to enable LLM-as-judge
-  abstention_threshold: 0.4
-  code_execute: false           # opt-in: subprocess execution of candidate code
-  code_execute_timeout: 5
-
-sampling:
-  samples_by_tag:
-    math: 5                     # self-consistency on math
-    reasoning: 3
-    default: 1
-  temperature: 0.7
-
-refinement:
-  enabled: false                # opt-in: critique -> revise pass
-  critique_model: ""
-
-escalation:
-  enabled: false                # opt-in: arbitrate divergent answers
-  model: ""
-  score_threshold: 0.6
-
 retrieval:
   enabled: false
   tags: []                      # tags to augment, e.g. [reasoning, general]
   provider: noop                # "noop" or "websearch" (needs SERP_API_KEY)
   max_chars: 4000
-
-bandit:
-  enabled: false                # outcome-driven Thompson sampling
-  state_path: ""                # JSON file for posterior persistence
 ```
 
 ---
@@ -308,10 +338,11 @@ Keyword regex with **saturating exponential** scoring (1 match -> 0.55, 2 -> 0.8
 
 ### Routing Decision
 
-| Confidence | Mode | Models Called |
-|---|---|---|
-| >= 0.8 | Single | 1 (best by tag, by priority OR by bandit) |
-| < 0.8 or `--parallel` | Parallel | up to N models x M samples |
+| `single_confidence` | Behavior |
+|---|---|
+| `1.01` (default) | Every prompt fans out to up to N models × M samples |
+| `0.8` (downshift) | High-confidence (≥0.8) classifications go single-model fast path |
+| `--parallel` flag | Forces parallel regardless of threshold |
 
 ### Verification
 
@@ -365,12 +396,13 @@ Built-in scorers:
 ## Testing
 
 ```bash
-pytest tests/                # 189 passing, 1 skipped
+pytest tests/                # 213 passing
 pytest tests/verifiers/      # verifier framework
 pytest tests/evals/          # harness + scorers
+pytest tests/test_proxy.py   # Anthropic-compatible HTTP proxy
 ```
 
-189 tests cover providers, verifiers (code/math/judge/heuristic), self-consistency, escalation, refinement, abstention, bandit (selection + posterior updates + persistence), event bus, LLM classifier, retrieval, eval harness + comparison harness, CLI (including eval subcommand), and config validation. The 1 skipped test runs only when `sentence-transformers` is installed.
+213 tests cover providers, verifiers (code/math/judge/heuristic), self-consistency, escalation, refinement, abstention, bandit (selection + posterior updates + persistence), event bus, LLM classifier, retrieval, eval harness + comparison harness, CLI (including eval + serve subcommands), Anthropic-API proxy compatibility, max-quality default policy, and config validation.
 
 ---
 

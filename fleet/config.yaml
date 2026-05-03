@@ -1,10 +1,19 @@
+# Fleet Router — bundled defaults.
+#
+# This config ships max-quality on by default. Every prompt fans out to
+# multiple Ollama models, gets verifier-scored, optionally escalated and
+# refined, and persists outcomes to the bandit. To downshift any of this
+# (e.g. for a fast/cheap path), drop a custom config at ~/.fleet/config.yaml.
+
 ollama:
   base_url: http://localhost:11434
   # api_key: ""  # set when Ollama requires authentication (e.g. cloud models)
+
 models:
   deepseek-v4-pro:
     tags: [code, reasoning, math]
     priority: 1
+    class: reasoning
   glm-5.1:
     tags: [creative, chinese, long_context]
     priority: 2
@@ -14,9 +23,51 @@ models:
   deepseek-v4-flash:
     tags: [code, general]
     priority: 4
+
 thresholds:
-  single_confidence: 0.8
+  # 1.01 means classification confidence can never clear the bar →
+  # every prompt goes to parallel mode. Set to 0.8 to opt back into
+  # the single-model fast path when the classifier is confident.
+  single_confidence: 1.01
   parallel_timeout: 60
   max_parallel: 3
+
 classifier:
   embeddings_model: all-MiniLM-L6-v2
+
+synthesis:
+  mode: verifier
+  # Strongest model arbitrates judge-based tags (reasoning, creative, …).
+  judge_model: deepseek-v4-pro
+  abstention_threshold: 0.4
+  # OFF for security: running LLM-generated code is a real RCE vector
+  # even with static safety checks. Opt in only if you trust the sandbox.
+  code_execute: false
+  code_execute_timeout: 5
+
+sampling:
+  samples_by_tag:
+    math: 7         # Wang+ majority-vote sweet spot
+    reasoning: 5
+    code: 3         # execution check is the strong signal
+    default: 3      # everything else: 3 drafts for the judge to rank
+  temperature: 0.7
+
+refinement:
+  enabled: true
+  critique_model: deepseek-v4-pro
+
+escalation:
+  enabled: true
+  model: deepseek-v4-pro
+  score_threshold: 0.6
+
+retrieval:
+  enabled: false
+  tags: []
+  provider: noop
+  max_chars: 4000
+
+bandit:
+  enabled: true
+  state_path: ~/.fleet/bandit.json

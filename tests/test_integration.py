@@ -8,10 +8,13 @@ from fleet.config import Config, ModelEntry, SamplingConfig, SynthesisConfig
 
 @pytest.mark.asyncio
 async def test_end_to_end_heuristic_mode():
-    """Smoke test the legacy heuristic synthesis path end-to-end."""
+    """Smoke test the legacy heuristic synthesis path end-to-end. Heuristic
+    mode + samples=1 is the only branch that still calls dispatcher.run
+    (everything else now goes through run_multi for the verifier path)."""
     config = Config(
         models={"deepseek-v4-pro": ModelEntry(tags=["code"], priority=1)},
         synthesis=SynthesisConfig(mode="heuristic"),
+        sampling=SamplingConfig(samples_by_tag={"default": 1}),
     )
     router = FleetRouter(config)
     router._registry._available = {"deepseek-v4-pro"}

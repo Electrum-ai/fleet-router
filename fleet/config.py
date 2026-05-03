@@ -46,7 +46,11 @@ class ModelEntry:
 
 @dataclass
 class ThresholdConfig:
-    single_confidence: float = 0.8
+    # Max-quality default: 1.01 means classification confidence can never
+    # clear the bar, so every prompt goes to parallel mode (multi-model
+    # ensemble + verifier-driven synthesis). Set to 0.8 to opt back into
+    # the speed-vs-quality split at the classifier.
+    single_confidence: float = 1.01
     parallel_timeout: int = 60
     max_parallel: int = 3
 
@@ -81,13 +85,16 @@ class SamplingConfig:
     """Self-consistency: how many independent samples per model per tag.
 
     Math/reasoning benefit hugely from N>1 (Wang et al., +18pp on GSM8K).
-    Creative/summarize don't — diversity from temperature is the point.
+    Max-quality defaults push samples up across the board — even tags
+    without an executable verifier benefit from giving the LLM judge
+    multiple drafts to rank.
     """
     samples_by_tag: dict[str, int] = field(
         default_factory=lambda: {
-            "math": 5,
-            "reasoning": 3,
-            "default": 1,
+            "math": 7,         # majority vote sweet spot per Wang+
+            "reasoning": 5,
+            "code": 3,         # execution verifier is the strong signal
+            "default": 3,      # everything else: 3 drafts for the judge
         }
     )
     temperature: float = 0.7
@@ -95,17 +102,20 @@ class SamplingConfig:
 
 @dataclass
 class RefinementConfig:
-    """Optional draft → critique → revise loop. OFF by default; ~5-20pp gain
-    on most tasks but doubles latency."""
-    enabled: bool = False
-    critique_model: str = ""  # empty = no refinement
+    """Draft → critique → revise loop. ON by default — ~5-20pp gain on
+    most tasks. Becomes a silent no-op when `critique_model` is empty
+    (preserves backward compatibility for users with custom configs that
+    pre-date this field)."""
+    enabled: bool = True
+    critique_model: str = ""  # empty = no refinement (silent no-op)
 
 
 @dataclass
 class EscalationConfig:
     """When the verifier abstains or scores low, escalate to a stronger
-    model with all candidates as context for arbitration."""
-    enabled: bool = False
+    model with all candidates as context for arbitration. ON by default —
+    becomes a silent no-op when `model` is empty."""
+    enabled: bool = True
     model: str = ""
     # Score below which we escalate even if the verifier didn't abstain.
     score_threshold: float = 0.6
@@ -125,8 +135,10 @@ class RetrievalConfig:
 
 @dataclass
 class BanditConfig:
-    """Outcome-driven Thompson-sampling bandit for (tag, model) selection."""
-    enabled: bool = False
+    """Outcome-driven Thompson-sampling bandit for (tag, model) selection.
+    ON by default — runs in-memory if `state_path` is empty (no learning
+    across restarts). The bundled YAML wires a persistent path."""
+    enabled: bool = True
     # Where to persist Beta posteriors. Empty = in-memory only.
     state_path: str = ""
 
@@ -266,7 +278,7 @@ def load_config(path: Path | str | None = None) -> Config:
     if not isinstance(thresh_raw, dict):
         thresh_raw = {}
     thresholds = ThresholdConfig(
-        single_confidence=_coerce_float(thresh_raw.get("single_confidence"), 0.8),
+        single_confidence=_coerce_float(thresh_raw.get("single_confidence"), 1.01),
         parallel_timeout=_coerce_int(thresh_raw.get("parallel_timeout"), 60),
         max_parallel=_coerce_int(thresh_raw.get("max_parallel"), 3),
     )
@@ -300,7 +312,9 @@ def load_config(path: Path | str | None = None) -> Config:
 
     samp_raw = raw.get("sampling", {}) if isinstance(raw.get("sampling"), dict) else {}
     samp_by_tag_raw = samp_raw.get("samples_by_tag", {})
-    samp_by_tag: dict[str, int] = {"math": 5, "reasoning": 3, "default": 1}
+    samp_by_tag: dict[str, int] = {
+        "math": 7, "reasoning": 5, "code": 3, "default": 3,
+    }
     if isinstance(samp_by_tag_raw, dict):
         for k, v in samp_by_tag_raw.items():
             samp_by_tag[str(k)] = max(1, _coerce_int(v, 1))
@@ -311,13 +325,13 @@ def load_config(path: Path | str | None = None) -> Config:
 
     ref_raw = raw.get("refinement", {}) if isinstance(raw.get("refinement"), dict) else {}
     refinement = RefinementConfig(
-        enabled=bool(ref_raw.get("enabled", False)),
+        enabled=bool(ref_raw.get("enabled", True)),
         critique_model=str(ref_raw.get("critique_model", "")),
     )
 
     esc_raw = raw.get("escalation", {}) if isinstance(raw.get("escalation"), dict) else {}
     escalation = EscalationConfig(
-        enabled=bool(esc_raw.get("enabled", False)),
+        enabled=bool(esc_raw.get("enabled", True)),
         model=str(esc_raw.get("model", "")),
         score_threshold=_coerce_float(esc_raw.get("score_threshold"), 0.6),
     )
@@ -334,7 +348,7 @@ def load_config(path: Path | str | None = None) -> Config:
 
     bandit_raw = raw.get("bandit", {}) if isinstance(raw.get("bandit"), dict) else {}
     bandit = BanditConfig(
-        enabled=bool(bandit_raw.get("enabled", False)),
+        enabled=bool(bandit_raw.get("enabled", True)),
         state_path=str(bandit_raw.get("state_path", "")),
     )
 

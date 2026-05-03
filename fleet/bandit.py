@@ -29,7 +29,8 @@ class ThompsonBandit:
         prior_alpha: float = 1.0,
         prior_beta: float = 1.0,
     ):
-        self._state_path = state_path
+        # Expand ~ so configs like "~/.fleet/bandit.json" Just Work.
+        self._state_path = os.path.expanduser(state_path) if state_path else None
         self._prior_alpha = prior_alpha
         self._prior_beta = prior_beta
         self._state: dict[str, dict[str, list[float]]] = {}

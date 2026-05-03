@@ -60,7 +60,8 @@ def test_missing_file_fallback():
     assert isinstance(cfg, Config)
     assert cfg.ollama.base_url == "http://localhost:11434"
     assert cfg.models == {}
-    assert cfg.thresholds.single_confidence == 0.8
+    # Max-quality defaults: every prompt fans out (single_confidence > 1.0).
+    assert cfg.thresholds.single_confidence > 1.0
     assert cfg.thresholds.parallel_timeout == 60
     assert cfg.thresholds.max_parallel == 3
     assert cfg.classifier.embeddings_model == "all-MiniLM-L6-v2"
@@ -123,5 +124,74 @@ def test_malformed_yaml_fallback(tmp_path):
     assert isinstance(cfg, Config)
     assert cfg.ollama.base_url == "http://localhost:11434"
     assert cfg.models == {}
-    assert cfg.thresholds.single_confidence == 0.8
+    assert cfg.thresholds.single_confidence > 1.0
     assert cfg.classifier.embeddings_model == "all-MiniLM-L6-v2"
+
+
+def test_max_quality_defaults_when_yaml_omits_optional_blocks(tmp_path):
+    """A YAML file with only the basics still gets max-quality defaults
+    for refinement / escalation / bandit / sampling — that's the policy."""
+    yaml_text = """
+ollama:
+  base_url: http://localhost:11434
+models:
+  some-model:
+    tags: [code]
+    priority: 1
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+
+    # All quality features ON by default.
+    assert cfg.refinement.enabled is True
+    assert cfg.escalation.enabled is True
+    assert cfg.bandit.enabled is True
+
+    # Sampling is aggressive across tags.
+    assert cfg.sampling.samples_by_tag["math"] >= 5
+    assert cfg.sampling.samples_by_tag["reasoning"] >= 3
+    assert cfg.sampling.samples_by_tag["default"] >= 2
+
+    # Every prompt fans out (single_confidence above the [0,1] band).
+    assert cfg.thresholds.single_confidence > 1.0
+
+
+def test_max_quality_defaults_on_bare_config():
+    """Even Config() with no YAML at all gets max-quality defaults — the
+    feature flags are silent no-ops when the wired models are empty."""
+    cfg = Config()
+    assert cfg.refinement.enabled is True
+    assert cfg.refinement.critique_model == ""  # silent no-op until wired
+    assert cfg.escalation.enabled is True
+    assert cfg.escalation.model == ""           # silent no-op until wired
+    assert cfg.bandit.enabled is True
+    assert cfg.bandit.state_path == ""          # in-memory until wired
+    assert cfg.thresholds.single_confidence > 1.0
+
+
+def test_user_can_downshift_quality_in_yaml(tmp_path):
+    """The whole point of max-quality-by-default is that you opt OUT, not in.
+    Verify the YAML override path works."""
+    yaml_text = """
+thresholds:
+  single_confidence: 0.7
+sampling:
+  samples_by_tag:
+    default: 1
+refinement:
+  enabled: false
+escalation:
+  enabled: false
+bandit:
+  enabled: false
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+
+    assert cfg.thresholds.single_confidence == 0.7
+    assert cfg.sampling.samples_by_tag["default"] == 1
+    assert cfg.refinement.enabled is False
+    assert cfg.escalation.enabled is False
+    assert cfg.bandit.enabled is False

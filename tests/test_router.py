@@ -8,15 +8,23 @@ from fleet.router import (
     ERROR_NO_MODEL,
     ERROR_NO_MODELS,
 )
-from fleet.config import Config, SynthesisConfig
+from fleet.config import Config, SamplingConfig, SynthesisConfig, ThresholdConfig
 
 
 @pytest.fixture
 def router():
-    # Existing tests assert against the heuristic synthesizer's behavior;
-    # opt them into heuristic mode explicitly. Verifier-path behavior is
-    # covered by tests/test_router_verifier.py.
-    config = Config(synthesis=SynthesisConfig(mode="heuristic"))
+    # Existing tests assert against the heuristic synthesizer's behavior on
+    # the legacy single-call code path (`dispatcher.run`). The new max-quality
+    # defaults — single_confidence>1 (always parallel) + samples>=3 per tag
+    # (always verifier path via run_multi) — would route past that code path
+    # entirely. Restore the legacy knobs here so these targeted tests keep
+    # exercising the dispatcher.run heuristic branch. End-to-end max-quality
+    # behavior is covered by test_router_verifier.py and test_config.py.
+    config = Config(
+        synthesis=SynthesisConfig(mode="heuristic"),
+        thresholds=ThresholdConfig(single_confidence=0.8),
+        sampling=SamplingConfig(samples_by_tag={"default": 1}),
+    )
     return FleetRouter(config)
 
 
