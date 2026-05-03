@@ -362,8 +362,12 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     api_key: Optional[str] = None,
+    prompt_deadline_s: float = _DEFAULT_PROMPT_DEADLINE_S,
 ) -> None:
     """Blocking serve — used by the CLI."""
-    app = build_app(router, api_key=api_key)
-    logger.info("fleet-proxy listening on http://%s:%d", host, port)
+    app = build_app(router, api_key=api_key, prompt_deadline_s=prompt_deadline_s)
+    logger.info(
+        "fleet-proxy listening on http://%s:%d (deadline=%.0fs)",
+        host, port, prompt_deadline_s,
+    )
     web.run_app(app, host=host, port=port, print=None)
