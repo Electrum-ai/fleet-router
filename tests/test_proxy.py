@@ -12,6 +12,7 @@ from fleet.proxy import (
     _maybe_enrich_with_ollama_hint,
     _parse_openai_chat_request,
     _parse_request,
+    _resolve_force_model,
     build_app,
 )
 from fleet.router import ERROR_ALL_MODELS_FAILED, ERROR_NO_MODEL
@@ -291,6 +292,109 @@ async def test_v1_models_returns_openai_shape():
     assert isinstance(body["data"], list)
     # No _registry on stub → empty list, not a 500.
     assert body["data"] == []
+
+
+# ---------- Force-model resolver ----------
+
+class _FakeRegistry:
+    def __init__(self, names):
+        self._names = list(names)
+
+    def all_available(self):
+        return self._names
+
+
+class _RouterWithModels:
+    def __init__(self, names):
+        self._registry = _FakeRegistry(names)
+
+    async def ask(self, *args, **kwargs):
+        return "n/a"
+
+
+def test_resolve_force_model_returns_none_for_unknown_name():
+    router = _RouterWithModels(["glm-5.1", "deepseek-v4-pro"])
+    # Default placeholder fleet sends when client didn't ask for anything.
+    assert _resolve_force_model("fleet-router", router) is None
+    # Claude Code sends Anthropic model names — fleet doesn't know them.
+    assert _resolve_force_model("claude-opus-4-7", router) is None
+    # Empty string short-circuits.
+    assert _resolve_force_model("", router) is None
+
+
+def test_resolve_force_model_returns_known_bare_name():
+    router = _RouterWithModels(["glm-5.1", "deepseek-v4-pro"])
+    assert _resolve_force_model("glm-5.1", router) == "glm-5.1"
+    assert _resolve_force_model("deepseek-v4-pro", router) == "deepseek-v4-pro"
+
+
+def test_resolve_force_model_strips_provider_prefixes():
+    """aider/litellm prefix model names with `openai/` etc."""
+    router = _RouterWithModels(["glm-5.1", "kimi-k2.6"])
+    assert _resolve_force_model("openai/glm-5.1", router) == "glm-5.1"
+    assert _resolve_force_model("anthropic/glm-5.1", router) == "glm-5.1"
+    assert _resolve_force_model("ollama/kimi-k2.6", router) == "kimi-k2.6"
+    assert _resolve_force_model("fleet/kimi-k2.6", router) == "kimi-k2.6"
+
+
+def test_resolve_force_model_tolerates_cloud_suffix():
+    """Some clients echo back the api_model with `:cloud` — strip and match."""
+    router = _RouterWithModels(["deepseek-v4-flash"])
+    assert _resolve_force_model("deepseek-v4-flash:cloud", router) == "deepseek-v4-flash"
+    assert _resolve_force_model("openai/deepseek-v4-flash:cloud", router) == "deepseek-v4-flash"
+
+
+def test_resolve_force_model_returns_none_when_router_lacks_registry():
+    """Stub routers in tests don't have _registry — must not raise."""
+    class _NoRegistry:
+        async def ask(self, *args, **kwargs):
+            return "n/a"
+    assert _resolve_force_model("glm-5.1", _NoRegistry()) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_forces_model_when_known():
+    """End-to-end: aider says `openai/glm-5.1` → router.ask receives
+    force_model='glm-5.1' (bypassing classifier+ensemble)."""
+    captured: dict = {}
+
+    class _CaptureRouter:
+        def __init__(self):
+            self._registry = _FakeRegistry(["glm-5.1", "deepseek-v4-pro"])
+
+        async def ask(self, prompt, *, force_parallel=False, force_model=None, system=None):
+            captured["force_model"] = force_model
+            return "ok"
+
+    app = build_app(_CaptureRouter())  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        await client.post("/v1/chat/completions", json={
+            "model": "openai/glm-5.1",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    assert captured["force_model"] == "glm-5.1"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_does_not_force_unknown_model():
+    captured: dict = {}
+
+    class _CaptureRouter:
+        def __init__(self):
+            self._registry = _FakeRegistry(["glm-5.1"])
+
+        async def ask(self, prompt, *, force_parallel=False, force_model=None, system=None):
+            captured["force_model"] = force_model
+            return "ok"
+
+    app = build_app(_CaptureRouter())  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        # Some upstream "openai/gpt-4o" — fleet has no idea what that is.
+        await client.post("/v1/chat/completions", json={
+            "model": "openai/gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    assert captured["force_model"] is None
 
 
 # ---------- OpenAI Chat Completions parser ----------

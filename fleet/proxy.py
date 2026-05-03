@@ -79,6 +79,40 @@ def _maybe_enrich_with_ollama_hint(text: str) -> str:
             return text + _OLLAMA_DOWN_HINT
     return text
 
+
+# Litellm-style provider prefixes that aider, openai SDK with custom routing,
+# and other clients prepend to a model name. Strip them so "openai/glm-5.1"
+# resolves to fleet's "glm-5.1".
+_PROVIDER_PREFIXES: tuple[str, ...] = ("openai/", "anthropic/", "ollama/", "fleet/")
+
+
+def _resolve_force_model(requested_model: str, router: FleetRouter) -> Optional[str]:
+    """If the client explicitly asked for a model fleet knows about, force
+    fleet to use it (bypassing the classifier+ensemble). Unknown names —
+    `fleet-router` (default placeholder), `claude-opus-4-7` (Claude Code
+    sending its own preferred model), `gpt-4o` (aider auto-fallback) —
+    return None so routing falls through to the normal auto-route path."""
+    name = requested_model.strip()
+    for prefix in _PROVIDER_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    if not name:
+        return None
+    try:
+        known = set(router._registry.all_available())  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+    if name in known:
+        return name
+    # Tolerate `:cloud` and other version suffixes — the registry uses bare
+    # names (deepseek-v4-pro), but clients may echo back the api_model
+    # (deepseek-v4-pro:cloud).
+    bare = name.split(":", 1)[0]
+    if bare in known:
+        return bare
+    return None
+
 # How many characters the SSE writer emits per content_block_delta event.
 # Smaller = smoother UX, more events. 80 is a reasonable balance — Claude
 # Code's renderer batches deltas anyway.
@@ -447,17 +481,18 @@ def build_app(
         parsed = _parse_request(body)
         prompt_tokens = _approx_tokens(parsed.prompt)
         message_id = f"msg_{uuid.uuid4().hex[:24]}"
+        force_model = _resolve_force_model(parsed.requested_model, router)
 
         logger.info(
-            "proxy: model=%s stream=%s prompt_chars=%d",
-            parsed.requested_model, parsed.stream, len(parsed.prompt),
+            "proxy: model=%s force=%s stream=%s prompt_chars=%d",
+            parsed.requested_model, force_model, parsed.stream, len(parsed.prompt),
         )
 
         # Non-streaming path: nothing to keep alive, just await + JSON respond.
         if not parsed.stream:
             try:
                 answer = await asyncio.wait_for(
-                    router.ask(parsed.prompt, system=parsed.system),
+                    router.ask(parsed.prompt, system=parsed.system, force_model=force_model),
                     timeout=prompt_deadline_s,
                 )
             except asyncio.TimeoutError:
@@ -495,7 +530,7 @@ def build_app(
         ))
 
         ask_task = asyncio.create_task(
-            router.ask(parsed.prompt, system=parsed.system)
+            router.ask(parsed.prompt, system=parsed.system, force_model=force_model)
         )
         deadline = asyncio.get_event_loop().time() + prompt_deadline_s
         try:
@@ -562,16 +597,17 @@ def build_app(
         parsed = _parse_openai_chat_request(body)
         prompt_tokens = _approx_tokens(parsed.prompt)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        force_model = _resolve_force_model(parsed.requested_model, router)
 
         logger.info(
-            "proxy[openai]: model=%s stream=%s prompt_chars=%d",
-            parsed.requested_model, parsed.stream, len(parsed.prompt),
+            "proxy[openai]: model=%s force=%s stream=%s prompt_chars=%d",
+            parsed.requested_model, force_model, parsed.stream, len(parsed.prompt),
         )
 
         if not parsed.stream:
             try:
                 answer = await asyncio.wait_for(
-                    router.ask(parsed.prompt, system=parsed.system),
+                    router.ask(parsed.prompt, system=parsed.system, force_model=force_model),
                     timeout=prompt_deadline_s,
                 )
             except asyncio.TimeoutError:
@@ -607,7 +643,7 @@ def build_app(
         ))
 
         ask_task = asyncio.create_task(
-            router.ask(parsed.prompt, system=parsed.system)
+            router.ask(parsed.prompt, system=parsed.system, force_model=force_model)
         )
         deadline = asyncio.get_event_loop().time() + prompt_deadline_s
         try:
