@@ -33,6 +33,44 @@ any chat (any directory):
 
 `/fleet` calls the `fleet` CLI directly, not the HTTP proxy.
 
+## Routing aider through Fleet (opt-in, scoped)
+
+aider speaks the OpenAI Chat Completions API, which the proxy now
+implements at `POST /v1/chat/completions`. Point aider at it via env
+vars and pick any model name fleet routes (the registry is exposed at
+`GET /v1/models`):
+
+```bash
+# Make sure the proxy is up (the SessionStart hook does this in this dir,
+# or run scripts/fleet-ensure-proxy.py manually elsewhere).
+
+export OPENAI_API_BASE=http://localhost:8765/v1
+export OPENAI_API_KEY=fleet-local
+
+aider --model openai/deepseek-v4-flash       # fast single-model
+aider --model openai/deepseek-v4-pro         # max-quality reasoning
+```
+
+Notes:
+
+- aider prefixes model names with `openai/` to tell LiteLLM which
+  provider format to use; fleet's proxy ignores the prefix and routes
+  by the bare model name.
+- Streaming and non-streaming both work. Heartbeats are SSE comment
+  lines (`: keep-alive`) which aider's parser silently skips, so
+  60–180s max-quality runs don't trigger the connection-reset bug.
+- The `--model openai/X` you pass is echoed back in `model` fields and
+  passed through to the underlying ollama:cloud route via fleet's
+  registry. To force a single model regardless of what aider sends,
+  edit `~/.fleet/config.yaml` to mark only one entry with `priority: 1`
+  and matching tags.
+- **Same tool-loop limitation as below**: aider's `/edit` and shell
+  modes use function-calling under the hood. Function calls are
+  flattened to text, so the model will *describe* edits rather than
+  apply them. For pure code-generation chat (`/ask`, `/code` with
+  manual paste), aider works great. For agentic editing, stay on
+  Anthropic/OpenAI direct.
+
 ## Routing Claude Code itself through Fleet (opt-in, scoped)
 
 The proxy implements enough of the Anthropic Messages API for plain chat
@@ -83,8 +121,9 @@ windows still use Anthropic.
 ## File map for this integration
 
 - `fleet/SKILL.md` — slash-command spec (mirrored to `~/.claude/skills/fleet/`)
-- `fleet/proxy.py` — Anthropic-compatible HTTP proxy (`/v1/messages`,
-  `/v1/models`, `/healthz`)
+- `fleet/proxy.py` — HTTP proxy speaking both Anthropic
+  (`/v1/messages`) and OpenAI (`/v1/chat/completions`) dialects, plus
+  `/v1/models` and `/healthz`
 - `scripts/fleet-toggle.sh` — manual shell-scoped opt-in
 - `scripts/fleet-ensure-proxy.py` — idempotent background-boot for the
   SessionStart hook

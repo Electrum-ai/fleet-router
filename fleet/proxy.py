@@ -1,22 +1,32 @@
-"""Anthropic Messages API-compatible HTTP proxy backed by FleetRouter.
+"""HTTP proxy backed by FleetRouter, speaking two API dialects.
 
-Lets `claude` (Claude Code CLI) talk to fleet → Ollama instead of Anthropic:
+Anthropic Messages API — for `claude` (Claude Code CLI):
 
     fleet serve --port 8765 &
     export ANTHROPIC_BASE_URL=http://localhost:8765
     export ANTHROPIC_API_KEY=fleet-local
     claude
 
-Implements the subset of the Messages API that Claude Code uses for chat:
-- POST /v1/messages (streaming and non-streaming)
+OpenAI Chat Completions API — for aider, OpenAI SDKs, llama.cpp UIs,
+and anything else that speaks /v1/chat/completions:
+
+    export OPENAI_API_BASE=http://localhost:8765/v1
+    export OPENAI_API_KEY=fleet-local
+    aider --model fleet-router
+
+Endpoints:
+- POST /v1/messages              (Anthropic, streaming + non-streaming)
+- POST /v1/chat/completions      (OpenAI, streaming + non-streaming)
+- GET  /v1/models                (OpenAI-style listing)
 - GET  /healthz
 
-Tool use (`tools`/`tool_use`/`tool_result` blocks) is NOT translated —
-Anthropic's tool format does not map cleanly to Ollama's OpenAI-style
-function calling. Tool blocks in the input are flattened into text so the
-underlying model at least sees the conversation; the model's reply is
-returned as a single text block. This makes plain chat work; agentic tool
-loops will not.
+Tool / function calling is NOT translated in either dialect — neither
+Anthropic's `tool_use`/`tool_result` blocks nor OpenAI's `tool_calls`
+function-calling JSON map cleanly onto fleet's single-prompt-in,
+single-answer-out interface. Tool blocks in the input are flattened
+into text so the underlying model at least sees the conversation;
+the reply is returned as a single text block. Plain chat works;
+agentic tool loops do not.
 """
 from __future__ import annotations
 
@@ -177,10 +187,137 @@ def _parse_request(body: dict) -> _ParsedRequest:
     )
 
 
+def _parse_openai_chat_request(body: dict) -> _ParsedRequest:
+    """Translate OpenAI Chat Completions JSON → ParsedRequest.
+
+    System messages (role=system) are extracted and concatenated into
+    `parsed.system`; user/assistant turns collapse into the prompt the
+    same way as Anthropic. Tool/function-call payloads are flattened to
+    readable text — see module docstring for the limitation."""
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        raise web.HTTPBadRequest(reason="messages: required non-empty array")
+
+    system_parts: list[str] = []
+    turns: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "user")
+        # OpenAI content can be string OR list of {type:"text"|"image_url",...}.
+        # Reuse _flatten_content — text blocks render naturally; image and
+        # tool_call/tool_result are summarized so the model sees something.
+        text = _flatten_content(msg.get("content", ""))
+        # OpenAI tool_calls live OUTSIDE content as a sibling field on the
+        # assistant message — surface them so the model retains context.
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = (tc.get("function") or {}) if isinstance(tc.get("function"), dict) else {}
+                name = fn.get("name", "?")
+                args = fn.get("arguments", "")
+                text = (text + "\n" if text else "") + f"[tool_call name={name} args={args}]"
+        if role == "tool":
+            # tool/function results have a `tool_call_id` sibling field.
+            tid = msg.get("tool_call_id", "?")
+            text = f"[tool_result id={tid}]\n{text}"
+        if not text.strip():
+            continue
+        if role == "system":
+            system_parts.append(text)
+            continue
+        marker = "Human" if role in ("user", "tool") else "Assistant"
+        turns.append(f"{marker}: {text}")
+    turns.append("Assistant:")
+
+    return _ParsedRequest(
+        prompt="\n\n".join(turns),
+        system="\n\n".join(system_parts) if system_parts else None,
+        stream=bool(body.get("stream", False)),
+        requested_model=str(body.get("model", "fleet-router")),
+        max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or 4096),
+    )
+
+
 def _approx_tokens(text: str) -> int:
     """Cheap token estimate. Anthropic clients display these but don't
     enforce them — accuracy isn't critical."""
     return max(1, len(text) // 4)
+
+
+def _coerce_answer_to_string(answer: Any) -> str:
+    """Both endpoints need to handle dict returns from router.ask() (parallel
+    mode without synthesis). Render as labeled sections to preserve info."""
+    if isinstance(answer, dict):
+        return "\n\n".join(f"--- {m} ---\n{t}" for m, t in answer.items())
+    return answer if isinstance(answer, str) else str(answer)
+
+
+def _build_chat_completion_response(
+    text: str, requested_model: str, completion_id: str, prompt_tokens: int,
+) -> dict:
+    """OpenAI Chat Completions non-streaming response shape."""
+    out_tokens = _approx_tokens(text)
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": requested_model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": out_tokens,
+            "total_tokens": prompt_tokens + out_tokens,
+        },
+    }
+
+
+def _openai_chunk(completion_id: str, model: str, delta: dict, finish: Optional[str] = None) -> bytes:
+    """One OpenAI streaming chunk frame (SSE `data:` line)."""
+    payload = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish,
+        }],
+    }
+    return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+
+
+def _openai_done() -> bytes:
+    """OpenAI's terminal sentinel — clients close the stream on this."""
+    return b"data: [DONE]\n\n"
+
+
+def _openai_heartbeat() -> bytes:
+    """SSE comment line — kept-alive marker that conforming clients ignore.
+    OpenAI's spec doesn't define a heartbeat event, but `:` comment lines
+    are part of the SSE protocol and are skipped by all standard parsers."""
+    return b": keep-alive\n\n"
+
+
+async def _stream_openai_body(
+    text: str, requested_model: str, completion_id: str,
+) -> AsyncIterator[bytes]:
+    """Emit `role: assistant` chunk → N×content chunks → final `finish_reason`
+    chunk → [DONE]. Caller is expected to flush the answer ONLY after
+    router.ask resolves; heartbeats during the wait happen separately."""
+    yield _openai_chunk(completion_id, requested_model, {"role": "assistant"})
+    for i in range(0, len(text), _STREAM_CHUNK_CHARS):
+        chunk = text[i:i + _STREAM_CHUNK_CHARS]
+        yield _openai_chunk(completion_id, requested_model, {"content": chunk})
+    yield _openai_chunk(completion_id, requested_model, {}, finish="stop")
+    yield _openai_done()
 
 
 def _build_message_response(
@@ -404,9 +541,128 @@ def build_app(
         await resp.write_eof()
         return resp
 
+    async def chat_completions(request: web.Request) -> web.StreamResponse:
+        """OpenAI Chat Completions endpoint — for aider, openai SDK,
+        llama.cpp UIs, and any other client speaking /v1/chat/completions.
+        Mirrors `messages` (Anthropic) structurally; differs only in
+        request parsing and SSE chunk format."""
+        if api_key:
+            # OpenAI clients send Authorization: Bearer <key>; some quirky
+            # ones still send x-api-key. Accept both.
+            presented = request.headers.get("authorization", "") or request.headers.get("x-api-key", "")
+            presented = presented.removeprefix("Bearer ").strip()
+            if not hmac.compare_digest(presented, api_key):
+                raise web.HTTPUnauthorized(reason="invalid api key")
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise web.HTTPBadRequest(reason=f"invalid JSON: {exc}")
+
+        parsed = _parse_openai_chat_request(body)
+        prompt_tokens = _approx_tokens(parsed.prompt)
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+        logger.info(
+            "proxy[openai]: model=%s stream=%s prompt_chars=%d",
+            parsed.requested_model, parsed.stream, len(parsed.prompt),
+        )
+
+        if not parsed.stream:
+            try:
+                answer = await asyncio.wait_for(
+                    router.ask(parsed.prompt, system=parsed.system),
+                    timeout=prompt_deadline_s,
+                )
+            except asyncio.TimeoutError:
+                raise web.HTTPGatewayTimeout(
+                    reason=f"router.ask exceeded {prompt_deadline_s}s deadline"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("router.ask failed (openai endpoint)")
+                raise web.HTTPInternalServerError(
+                    reason=f"router error: {type(exc).__name__}: {exc}"
+                )
+            answer = _maybe_enrich_with_ollama_hint(_coerce_answer_to_string(answer))
+            return web.json_response(_build_chat_completion_response(
+                answer, parsed.requested_model, completion_id, prompt_tokens,
+            ))
+
+        # Streaming path — same pattern as Anthropic: open SSE, fire one
+        # frame immediately, then heartbeat (SSE comment line) every
+        # _HEARTBEAT_INTERVAL_S until router.ask resolves. The first
+        # `data: {role: assistant}` chunk is the OpenAI equivalent of
+        # message_start — clients use it to render the empty bubble.
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await resp.prepare(request)
+        await resp.write(_openai_chunk(
+            completion_id, parsed.requested_model, {"role": "assistant"},
+        ))
+
+        ask_task = asyncio.create_task(
+            router.ask(parsed.prompt, system=parsed.system)
+        )
+        deadline = asyncio.get_event_loop().time() + prompt_deadline_s
+        try:
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    ask_task.cancel()
+                    raise asyncio.TimeoutError(
+                        f"router.ask exceeded {prompt_deadline_s}s deadline"
+                    )
+                tick = min(_HEARTBEAT_INTERVAL_S, remaining)
+                try:
+                    answer = await asyncio.wait_for(
+                        asyncio.shield(ask_task), timeout=tick,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    if ask_task.done():
+                        continue
+                    await resp.write(_openai_heartbeat())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("router.ask failed mid-stream (openai)")
+            err_text = f"(router error: {type(exc).__name__}: {exc})"
+            # Reuse the streaming body — emit the error as content so
+            # clients see structured failure text, then [DONE].
+            for i in range(0, len(err_text), _STREAM_CHUNK_CHARS):
+                await resp.write(_openai_chunk(
+                    completion_id, parsed.requested_model,
+                    {"content": err_text[i:i + _STREAM_CHUNK_CHARS]},
+                ))
+            await resp.write(_openai_chunk(
+                completion_id, parsed.requested_model, {}, finish="stop",
+            ))
+            await resp.write(_openai_done())
+            await resp.write_eof()
+            return resp
+
+        answer = _maybe_enrich_with_ollama_hint(_coerce_answer_to_string(answer))
+        # Skip the role chunk we already sent — start at the content chunks.
+        for i in range(0, len(answer), _STREAM_CHUNK_CHARS):
+            await resp.write(_openai_chunk(
+                completion_id, parsed.requested_model,
+                {"content": answer[i:i + _STREAM_CHUNK_CHARS]},
+            ))
+        await resp.write(_openai_chunk(
+            completion_id, parsed.requested_model, {}, finish="stop",
+        ))
+        await resp.write(_openai_done())
+        await resp.write_eof()
+        return resp
+
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/v1/models", list_models)
     app.router.add_post("/v1/messages", messages)
+    app.router.add_post("/v1/chat/completions", chat_completions)
     return app
 
 

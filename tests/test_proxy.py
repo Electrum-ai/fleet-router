@@ -10,6 +10,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from fleet.proxy import (
     _flatten_content,
     _maybe_enrich_with_ollama_hint,
+    _parse_openai_chat_request,
     _parse_request,
     build_app,
 )
@@ -290,6 +291,191 @@ async def test_v1_models_returns_openai_shape():
     assert isinstance(body["data"], list)
     # No _registry on stub → empty list, not a 500.
     assert body["data"] == []
+
+
+# ---------- OpenAI Chat Completions parser ----------
+
+def test_parse_openai_extracts_system_messages_and_collapses_turns():
+    body = {
+        "model": "fleet-router",
+        "messages": [
+            {"role": "system", "content": "you are concise"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "say more"},
+        ],
+    }
+    parsed = _parse_openai_chat_request(body)
+    assert parsed.system == "you are concise"
+    assert "Human: hi" in parsed.prompt
+    assert "Assistant: hello" in parsed.prompt
+    assert "Human: say more" in parsed.prompt
+    assert parsed.prompt.rstrip().endswith("Assistant:")
+    assert parsed.requested_model == "fleet-router"
+    assert parsed.stream is False
+
+
+def test_parse_openai_concatenates_multiple_system_messages():
+    body = {
+        "model": "x",
+        "messages": [
+            {"role": "system", "content": "rule one"},
+            {"role": "system", "content": "rule two"},
+            {"role": "user", "content": "ok"},
+        ],
+    }
+    parsed = _parse_openai_chat_request(body)
+    assert parsed.system == "rule one\n\nrule two"
+
+
+def test_parse_openai_summarizes_assistant_tool_calls():
+    body = {
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "what's the weather"},
+            {
+                "role": "assistant",
+                "content": "let me check",
+                "tool_calls": [{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"NYC\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "72F sunny"},
+            {"role": "user", "content": "thanks"},
+        ],
+    }
+    parsed = _parse_openai_chat_request(body)
+    # Tool call surfaced as text inside assistant turn
+    assert "[tool_call name=get_weather" in parsed.prompt
+    assert "NYC" in parsed.prompt
+    # Tool result surfaced as a Human turn (since fleet has no tool role)
+    assert "[tool_result id=call_abc]" in parsed.prompt
+    assert "72F sunny" in parsed.prompt
+
+
+def test_parse_openai_rejects_empty_messages():
+    with pytest.raises(web.HTTPBadRequest):
+        _parse_openai_chat_request({"model": "x", "messages": []})
+
+
+def test_parse_openai_max_tokens_falls_back_to_max_completion_tokens():
+    """OpenAI's newer API renamed max_tokens → max_completion_tokens."""
+    parsed = _parse_openai_chat_request({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_completion_tokens": 200,
+    })
+    assert parsed.max_tokens == 200
+
+
+# ---------- /v1/chat/completions HTTP integration ----------
+
+@pytest.mark.asyncio
+async def test_chat_completions_non_streaming_shape():
+    router = _StubRouter("the answer is 42")
+    app = build_app(router)  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/chat/completions", json={
+            "model": "fleet-router",
+            "messages": [{"role": "user", "content": "what is the answer"}],
+        })
+        assert resp.status == 200
+        body = await resp.json()
+
+    assert body["object"] == "chat.completion"
+    assert body["model"] == "fleet-router"
+    assert body["id"].startswith("chatcmpl-")
+    choice = body["choices"][0]
+    assert choice["index"] == 0
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"] == {"role": "assistant", "content": "the answer is 42"}
+    usage = body["usage"]
+    assert usage["prompt_tokens"] > 0
+    assert usage["completion_tokens"] > 0
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_streaming_chunk_sequence():
+    router = _StubRouter("streamed payload")
+    app = build_app(router)  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/chat/completions", json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "stream"}],
+            "stream": True,
+        })
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("text/event-stream")
+        raw = (await resp.read()).decode("utf-8")
+
+    # Final terminator
+    assert raw.rstrip().endswith("data: [DONE]")
+
+    # Walk the data: lines, ignoring SSE comment heartbeats (lines starting with ':')
+    chunks: list[dict] = []
+    for line in raw.splitlines():
+        if line.startswith("data: ") and line.strip() != "data: [DONE]":
+            chunks.append(json.loads(line[len("data: "):]))
+
+    # First chunk: role marker, no finish_reason
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert chunks[0]["choices"][0]["finish_reason"] is None
+    assert chunks[0]["object"] == "chat.completion.chunk"
+
+    # Last data chunk: empty delta + finish_reason=stop
+    assert chunks[-1]["choices"][0]["delta"] == {}
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+    # Middle chunks reassemble to the full text
+    body = "".join(
+        c["choices"][0]["delta"].get("content", "")
+        for c in chunks[1:-1]
+    )
+    assert body == "streamed payload"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_api_key_via_authorization_bearer():
+    router = _StubRouter()
+    app = build_app(router, api_key="secret-token")  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        # Missing -> 401
+        bad = await client.post("/v1/chat/completions", json={
+            "model": "x", "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert bad.status == 401
+
+        # Bearer token -> OK (the OpenAI SDK default)
+        ok = await client.post(
+            "/v1/chat/completions",
+            json={"model": "x", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        assert ok.status == 200
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_enriches_ollama_down_in_streaming():
+    router = _StubRouter(ERROR_ALL_MODELS_FAILED)
+    app = build_app(router)  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/chat/completions", json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        })
+        assert resp.status == 200
+        raw = (await resp.read()).decode("utf-8")
+    body = "".join(
+        json.loads(line[len("data: "):])["choices"][0]["delta"].get("content", "")
+        for line in raw.splitlines()
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
+    )
+    assert ERROR_ALL_MODELS_FAILED in body
+    assert "ollama serve" in body
 
 
 @pytest.mark.asyncio
