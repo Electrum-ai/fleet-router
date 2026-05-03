@@ -76,3 +76,47 @@ def test_pick_general_tie_returns_dict():
     best = synth.pick(responses, task_tag="general")
     # Consensus is weak and there is a tie for longest length
     assert best == {"glm": "abc", "minimax": "def"}
+
+
+def test_pick_math_consensus():
+    synth = Synthesizer()
+    responses = {
+        "glm": "The answer is 42 because 6 times 7 equals 42.",
+        "minimax": "The answer is 42 because 6 * 7 = 42.",
+        "deepseek": "I think the answer is 99.",
+    }
+    best = synth.pick(responses, task_tag="math")
+    # glm and minimax are similar (consensus), so one of them should win
+    assert "42" in best
+
+
+def test_all_models_failed():
+    synth = Synthesizer()
+    responses = {
+        "glm": None,
+        "minimax": None,
+    }
+    best = synth.pick(responses, task_tag="general")
+    assert best == "(all models failed)"
+
+
+def test_single_valid_response():
+    synth = Synthesizer()
+    responses = {
+        "glm": None,
+        "minimax": "only valid response",
+    }
+    best = synth.pick(responses, task_tag="general")
+    assert best == "only valid response"
+
+
+def test_empty_string_responses():
+    synth = Synthesizer()
+    responses = {
+        "glm": "",
+        "minimax": "  ",
+        "deepseek": "valid content here",
+    }
+    best = synth.pick(responses, task_tag="general")
+    # Empty strings and whitespace-only should be filtered out
+    assert best == "valid content here"

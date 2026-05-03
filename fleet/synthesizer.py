@@ -1,15 +1,16 @@
 """Pick the best response from parallel model outputs."""
 from __future__ import annotations
 
+import ast
 import difflib
-import py_compile
-import tempfile
-from pathlib import Path
 from typing import Optional
 
 
 class Synthesizer:
     """Rule-based synthesis: no LLM, just heuristics."""
+
+    MIN_SUMMARY_LENGTH = 20
+    CONSENSUS_THRESHOLD = 0.3
 
     def pick(self, responses: dict[str, Optional[str]], task_tag: str) -> str | dict[str, str]:
         """Return best response string, or dict of all if no clear winner."""
@@ -41,14 +42,9 @@ class Synthesizer:
     @staticmethod
     def _is_valid_python(code: str) -> bool:
         try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-                f.write(code)
-                path = f.name
-            py_compile.compile(path, doraise=True)
-            Path(path).unlink(missing_ok=True)
+            ast.parse(code)
             return True
         except Exception:
-            Path(path).unlink(missing_ok=True)
             return False
 
     def _pick_reasoning(self, valid: dict[str, str]) -> str | dict[str, str]:
@@ -67,7 +63,7 @@ class Synthesizer:
 
     def _pick_summarize(self, valid: dict[str, str]) -> str | dict[str, str]:
         """Prefer shortest that still has content."""
-        non_empty = [t for t in valid.values() if len(t.strip()) > 20]
+        non_empty = [t for t in valid.values() if len(t.strip()) > self.MIN_SUMMARY_LENGTH]
         if non_empty:
             return min(non_empty, key=len)
         return min(valid.values(), key=len)
@@ -80,7 +76,7 @@ class Synthesizer:
         """Pick the response with highest average similarity to others.
 
         Self-consistency score is primary. If consensus is weak
-        (best_score < 0.3), fall back to the longest response. If there is a
+        (best_score < CONSENSUS_THRESHOLD), fall back to the longest response. If there is a
         tie for longest, return the full ``valid`` dict so the user can choose.
         """
         texts = list(valid.values())
@@ -98,7 +94,7 @@ class Synthesizer:
         best_name = max(scores, key=scores.get)
         best_score = scores[best_name]
 
-        if best_score >= 0.3:
+        if best_score >= self.CONSENSUS_THRESHOLD:
             return valid[best_name]
 
         # Consensus is weak — fall back to longest response
