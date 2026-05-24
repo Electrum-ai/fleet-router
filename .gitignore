@@ -3,5 +3,8 @@
 __pycache__/
 *.pyc
 
+# macOS Finder metadata
+.DS_Store
+
 # Claude Code per-session runtime state — must not be checked in.
 .claude/scheduled_tasks.lock
