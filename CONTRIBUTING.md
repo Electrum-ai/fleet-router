@@ -39,4 +39,4 @@ Exit code `3` means regression — that's a blocker.
 
 ## Questions?
 
-Open a [discussion](https://github.com/sambawy01/fleet-router/discussions) if you want to talk through an idea before writing code.
+Open a [discussion](https://github.com/Electrum-ai/fleet-router/discussions) if you want to talk through an idea before writing code.

@@ -93,7 +93,7 @@ To downshift (faster, cheaper, lower quality), opt out explicitly in `~/.fleet/c
 ## Quick Start
 
 ```bash
-git clone https://github.com/sambawy01/fleet-router.git
+git clone https://github.com/Electrum-ai/fleet-router.git
 cd fleet-router
 python -m venv venv && source venv/bin/activate
 pip install -e ".[dev]"
