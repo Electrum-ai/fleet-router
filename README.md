@@ -13,7 +13,7 @@
 *Quality-first. Not fastest. Not cheapest. **Best answer.***
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-244%20passing-2ea44f)](#testing)
+[![Tests](https://img.shields.io/badge/tests-256%20passing-2ea44f)](#testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Runtime: Ollama](https://img.shields.io/badge/runtime-Ollama-FF6B35?logo=ollama&logoColor=white)](https://ollama.com)
 [![Quality: Max by default](https://img.shields.io/badge/quality-max%20by%20default-blueviolet)](#quality-by-default)
@@ -508,14 +508,14 @@ Built-in scorers:
 ## Testing
 
 ```bash
-pytest tests/                # 244 passing
+pytest tests/                # 256 passing
 pytest tests/verifiers/      # verifier framework
 pytest tests/evals/          # harness + scorers
 pytest tests/test_proxy.py   # Anthropic + OpenAI proxy compatibility
 pytest tests/test_cli.py     # CLI: ask / eval / serve / quiet
 ```
 
-244 tests across 22 files cover providers, verifiers (code/math/judge/heuristic), self-consistency, escalation, refinement, abstention, bandit (selection + posterior updates + persistence), event bus + progress sink, LLM classifier, retrieval, eval harness + comparison harness, CLI (including eval + serve subcommands + aclose lifecycle), Anthropic + OpenAI proxy compatibility (parsing, streaming, force-model resolver, auth, ollama-down enrichment), max-quality default policy, and config validation.
+256 tests across 28 files cover providers (including session reuse + concurrency-cap regression guards), verifiers (code/math/judge/heuristic), self-consistency, escalation, refinement, abstention (including self-judge bias guards), bandit (selection + posterior updates + persistence), event bus + progress sink, LLM classifier, retrieval, eval harness + comparison harness, CLI (including eval + serve subcommands + aclose lifecycle), Anthropic + OpenAI proxy compatibility (parsing, streaming heartbeat/deadline, force-model resolver, auth, ollama-down enrichment, concurrent requests), max-quality default policy, and config validation.
 
 ---
 
@@ -557,7 +557,7 @@ fleet-router/
 ├── scripts/
 │   ├── fleet-toggle.sh        # shell-scoped opt-in for Claude Code backend
 │   └── fleet-ensure-proxy.py  # idempotent flock-guarded auto-boot
-└── tests/                     # 244 tests across 22 files
+└── tests/                     # 256 tests across 28 files
 ```
 
 ---
