@@ -211,7 +211,7 @@ def test_cloud_models_in_all_available():
         "glm-5.1": ModelEntry(tags=["creative"], priority=2),
     })
     reg = ModelRegistry(config)
-    reg._available = set()  # empty local registry
+    reg.set_available(set())  # empty local registry (refreshed, but nothing pulled)
 
     names = reg.all_available()
     assert "deepseek-v4-pro" in names
