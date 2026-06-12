@@ -321,3 +321,71 @@ synthesis:
     cfg = load_config(config_path)
     # Non-string coerces to its str form (or empty), never crashes.
     assert isinstance(cfg.synthesis.code_execute_sandbox, str)
+
+
+# --------------------------------------------------------------------------- #
+# Per-tag abstention thresholds (Part A)
+# --------------------------------------------------------------------------- #
+
+
+def test_abstention_thresholds_default_empty():
+    """No override map by default ⇒ every tag uses the global 0.4."""
+    cfg = Config()
+    assert cfg.synthesis.abstention_threshold == 0.4
+    assert cfg.synthesis.abstention_thresholds == {}
+
+
+def test_abstention_thresholds_parsed_and_floats_coerced(tmp_path):
+    yaml_text = """
+synthesis:
+  abstention_threshold: 0.4
+  abstention_thresholds:
+    math: 0.6
+    code: "0.55"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.synthesis.abstention_thresholds == {"math": 0.6, "code": 0.55}
+
+
+def test_abstention_thresholds_clamped_to_unit_interval(tmp_path):
+    yaml_text = """
+synthesis:
+  abstention_thresholds:
+    high: 1.7
+    low: -0.3
+    ok: 0.5
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.synthesis.abstention_thresholds == {
+        "high": 1.0, "low": 0.0, "ok": 0.5,
+    }
+
+
+def test_abstention_thresholds_drops_junk_keys_and_values(tmp_path):
+    yaml_text = """
+synthesis:
+  abstention_thresholds:
+    math: 0.6
+    bad: "not-a-number"
+    none_val: null
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    # Only the parseable numeric entry survives; junk is silently dropped.
+    assert cfg.synthesis.abstention_thresholds == {"math": 0.6}
+
+
+def test_abstention_thresholds_non_mapping_ignored(tmp_path):
+    yaml_text = """
+synthesis:
+  abstention_thresholds: "oops not a dict"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.synthesis.abstention_thresholds == {}

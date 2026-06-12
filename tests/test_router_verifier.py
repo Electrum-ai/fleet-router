@@ -117,6 +117,68 @@ async def test_escalation_runs_when_verifier_abstains():
 
 
 @pytest.mark.asyncio
+async def test_escalation_rescue_records_answered_not_abstention():
+    """FIX 2 (calibration bias): when the verifier ABSTAINS but escalation then
+    SUCCEEDS, the FINAL synthesis event the calibration collector sees must
+    record the case as ANSWERED (abstain=False) carrying the ESCALATED score —
+    not as an abstention. Emitting the pre-escalation event biased
+    `fleet --calibrate` by overcounting abstention on escalation-rescued
+    cases."""
+    from fleet.events import ResponseSynthesized
+
+    config = Config(
+        models={
+            "model-a": ModelEntry(tags=["math"], priority=1),
+            "model-b": ModelEntry(tags=["math"], priority=2),
+            "judge": ModelEntry(tags=["math"], priority=3),
+        },
+        synthesis=SynthesisConfig(mode="verifier"),
+        sampling=SamplingConfig(samples_by_tag={"math": 1, "default": 1}),
+        escalation=EscalationConfig(enabled=True, model="judge", score_threshold=0.6),
+    )
+    router = FleetRouter(config)
+    router._registry._available = {"model-a", "model-b", "judge"}
+    router._registry._refreshed = True
+
+    events: list = []
+    router._events.subscribe(events.append)
+
+    with patch.object(router._classifier, "classify", return_value=("math", 0.4)), \
+         patch.object(router._dispatcher, "run_multi", new_callable=AsyncMock) as mock_multi, \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_run, \
+         patch.object(router._verifier_synth, "pick", new_callable=AsyncMock) as mock_pick:
+        mock_multi.return_value = {"model-a": ["1"], "model-b": ["2"]}
+        # Verifier abstains (winner=None, abstain=True, score below threshold).
+        mock_pick.return_value = VerificationResult(
+            winner=None,
+            all_scored=[Candidate("model-a", 0, "the answer is 1", score=0.2)],
+            abstain=True,
+        )
+        # Arbiter agrees with model-a's "1" → re-scores at the top → accepted.
+        mock_run.return_value = {"judge": "After reconciling, the answer is 1."}
+        result = await router.ask("solve")
+
+    assert result == "After reconciling, the answer is 1."
+
+    # The LAST synthesis event must reflect the rescued, answered outcome.
+    synth = [e for e in events if isinstance(e, ResponseSynthesized)]
+    assert synth, "expected at least one ResponseSynthesized event"
+    final = synth[-1]
+    assert final.abstain is False                      # NOT recorded as abstention
+    assert final.winner_model == "judge"               # the escalation arbiter
+    assert final.winner_score is not None              # carries the escalated score
+    assert final.winner_score >= 0.6                   # cleared the escalation bar
+
+    # End-to-end: the calibration collector records this as ANSWERED, not abstained.
+    from evals.runner import _SynthesisCollector
+    collector = _SynthesisCollector(router)
+    collector.reset()
+    collector._sink(final)
+    assert collector.abstained is False
+    assert collector.winner_score == final.winner_score
+
+
+@pytest.mark.asyncio
 async def test_refinement_runs_critique_then_revise():
     config = Config(
         models={"model-a": ModelEntry(tags=["general"], priority=1),
@@ -554,10 +616,11 @@ async def test_escalation_verify_uses_neutral_judge_when_judge_is_arbiter():
         winner=Candidate("other", 0, "an original answer", score=0.5),
         all_scored=[Candidate("other", 0, "an original answer", score=0.5)],
     )
-    ok = await router._escalation_verified(
+    ok, esc_score = await router._escalation_verified(
         "prompt", "reasoning", "the arbiter answer", "J", result,
     )
     assert ok is True
+    assert esc_score is not None
     # Neutral model "N" graded it — NOT the arbiter "J".
     assert captured["model"] == "N"
 
@@ -585,8 +648,9 @@ async def test_escalation_verify_abstains_when_judge_is_arbiter_and_no_neutral()
         winner=Candidate("J", 0, "ans", score=0.5),
         all_scored=[Candidate("J", 0, "ans", score=0.5)],
     )
-    ok = await router._escalation_verified("p", "reasoning", "arbiter ans", "J", result)
+    ok, esc_score = await router._escalation_verified("p", "reasoning", "arbiter ans", "J", result)
     assert ok is False
+    assert esc_score is None
 
 
 # ---------- chain-of-thought leak regression guards (BUG 1) ----------

@@ -148,6 +148,7 @@ class FleetRouter:
         return VerifierSynthesizer(
             registry,
             abstention_threshold=self._config.synthesis.abstention_threshold,
+            abstention_thresholds=self._config.synthesis.abstention_thresholds,
         )
 
     def _make_judge(
@@ -341,12 +342,6 @@ class FleetRouter:
             temperature=self._config.sampling.temperature,
         )
         result = await self._verifier_synth.pick(prompt, samples_per_model, task_tag=tag)
-        self._events.emit(ResponseSynthesized(
-            tag=tag, mode="verifier",
-            winner_model=result.winner.model if result.winner else None,
-            winner_score=result.winner.score if result.winner else None,
-            abstain=result.abstain,
-        ))
         # Feed verifier scores back into the bandit's posteriors. The N
         # candidates a model emits in one round are correlated samples of the
         # SAME generation, not N independent Bernoulli trials, so they collapse
@@ -355,14 +350,38 @@ class FleetRouter:
         # multiply the observation count.
         self._update_bandit(tag, result)
 
+        # The synthesis event is emitted ONCE, reflecting the FINAL returned
+        # outcome — AFTER any escalation/refinement post-pass. The calibration
+        # collector reads the LAST event, so it MUST match what _parallel
+        # actually returns: a verifier abstention that escalation then rescues
+        # has to be recorded as ANSWERED with the escalated score, not as an
+        # abstention. Emitting before the post-passes (the old behavior) biased
+        # `fleet --calibrate` by undercounting coverage on exactly the tags
+        # where escalation does the most work.
+        def _emit_final(
+            *, winner_model: Optional[str], winner_score: Optional[float],
+            abstain: bool,
+        ) -> None:
+            self._events.emit(ResponseSynthesized(
+                tag=tag, mode="verifier",
+                winner_model=winner_model, winner_score=winner_score,
+                abstain=abstain,
+            ))
+
         # Disagreement escalation: when verifier abstains OR winner score is
         # weak, ask a stronger model to arbitrate using all candidates as context.
         if self._should_escalate(result):
             escalated = await self._escalate(prompt, result, tag, system=system)
             if escalated is not None:
-                return escalated
+                esc_text, esc_score, esc_model = escalated
+                _emit_final(
+                    winner_model=esc_model, winner_score=esc_score,
+                    abstain=False,
+                )
+                return esc_text
 
         if result.abstain:
+            _emit_final(winner_model=None, winner_score=None, abstain=True)
             return self._format_abstention(result, tag)
 
         winner_text = result.winner_text or ERROR_ALL_MODELS_FAILED
@@ -374,8 +393,18 @@ class FleetRouter:
                 winner_model=result.winner.model, system=system,
             )
             if refined:
-                return refined
+                ref_text, ref_score = refined
+                _emit_final(
+                    winner_model=result.winner.model, winner_score=ref_score,
+                    abstain=False,
+                )
+                return ref_text
 
+        _emit_final(
+            winner_model=result.winner.model if result.winner else None,
+            winner_score=result.winner.score if result.winner else None,
+            abstain=False,
+        )
         return winner_text
 
     def _select_models(
@@ -458,7 +487,10 @@ class FleetRouter:
 
     async def _escalate(
         self, prompt: str, result, tag: str, system: str | None = None
-    ) -> str | None:
+    ) -> Optional[tuple[str, float, str]]:
+        """Returns ``(escalated_answer, esc_score, arbiter_model)`` on a verified
+        rescue, else None. The score + model are threaded out so ``_parallel``
+        can emit a FINAL synthesis event reflecting the escalated outcome."""
         configured_model = self._config.escalation.model
         if not configured_model:
             return None
@@ -498,23 +530,29 @@ class FleetRouter:
         # accept only when it clears the abstention threshold AND verifies at
         # least as well as the best original. Otherwise return None so the
         # caller falls through to the abstention path.
-        if not await self._escalation_verified(
+        verified, esc_score = await self._escalation_verified(
             prompt, tag, escalated_clean, model, result
-        ):
+        )
+        if not verified:
             logger.info(
                 "escalated answer from %r did not verify; abstaining instead",
                 model,
             )
             return None
-        return escalated_clean
+        return escalated_clean, esc_score, model
 
     async def _escalation_verified(
         self, prompt: str, tag: str, answer: str, arbiter_model: str,
         result: VerificationResult,
-    ) -> bool:
-        """True iff `answer` scores >= the abstention threshold AND >= the best
-        original candidate under the tag verifier. The arbiter answer is tagged
-        with sample_idx=-1 so it's identifiable after re-scoring.
+    ) -> tuple[bool, Optional[float]]:
+        """Returns ``(verified, esc_score)``. ``verified`` is True iff `answer`
+        scores >= the abstention threshold AND >= the best original candidate
+        under the tag verifier; ``esc_score`` is the arbiter answer's verified
+        score (None when it couldn't be scored). The score is threaded out so
+        the caller can record the FINAL escalated outcome in the synthesis
+        event (calibration must see the rescued score, not the pre-escalation
+        abstention). The arbiter answer is tagged with sample_idx=-1 so it's
+        identifiable after re-scoring.
 
         Neutral-judge discipline (self-preference guard): if the tag verifier is
         the LLM judge and the judge model IS the arbiter that wrote `answer`, we
@@ -528,12 +566,12 @@ class FleetRouter:
         ] + list(result.all_scored)
         vres, ok = await self._score_neutral(prompt, verify_cands, tag, arbiter_model)
         if not ok:
-            return False
+            return False, None
         esc_score = next(
             (c.score for c in vres.all_scored if c.sample_idx == -1), None
         )
         if esc_score is None:
-            return False
+            return False, None
         # NOTE: esc_score comes from a re-score of the pool that INCLUDES the
         # arbiter's own answer (a mild self-confirmation advantage), while
         # best_original is the pre-escalation score the originals earned WITHOUT
@@ -542,8 +580,12 @@ class FleetRouter:
         # already a conservative bar, and re-scoring the originals in isolation
         # would discard the arbiter's relative ranking signal entirely.
         best_original = max((c.score for c in result.all_scored), default=0.0)
-        threshold = self._config.synthesis.abstention_threshold
-        return esc_score >= threshold and esc_score >= best_original
+        # Use the SAME per-tag cut-point the synthesizer would apply to this
+        # tag — an escalated answer must clear the bar for the tag being
+        # escalated, not a global default that ignores the tag's score scale.
+        threshold = self._verifier_synth.abstention_threshold_for(tag)
+        verified = esc_score >= threshold and esc_score >= best_original
+        return verified, esc_score
 
     def _pick_arbiter(
         self, configured: str, candidates: set[str]
@@ -616,7 +658,10 @@ class FleetRouter:
     async def _refine(
         self, prompt: str, draft: str, tag: str, result: VerificationResult,
         winner_model: Optional[str] = None, system: str | None = None,
-    ) -> str | None:
+    ) -> Optional[tuple[str, float]]:
+        """Returns ``(revised_answer, revised_score)`` when an accepted rewrite
+        improves on the draft, else None. The score is threaded out so
+        ``_parallel`` records the post-refinement score in the FINAL event."""
         # Don't let an unverified rewrite overwrite a strong numeric majority:
         # when the math vote already agrees strongly, skip refinement entirely.
         # A verified arithmetic answer shouldn't be "improved" by prose.
@@ -675,19 +720,24 @@ class FleetRouter:
         # judges it better than the original winner. On tie or worse, keep the
         # original (return None) — a single unverified rewrite must never
         # silently overwrite a verified answer.
-        if await self._refinement_improves(
+        improved, revised_score = await self._refinement_improves(
             prompt, tag, revised_clean, draft, result,
             producer_model=critique_model,
-        ):
-            return revised_clean
+        )
+        if improved:
+            return revised_clean, revised_score
         return None
 
     async def _refinement_improves(
         self, prompt: str, tag: str, revised: str, original: str,
         result: VerificationResult, producer_model: Optional[str] = None,
-    ) -> bool:
-        """True iff `revised` is judged better than `original` by the tag
-        verifier. Synthetic, DISTINCT model names keep the heuristic/judge
+    ) -> tuple[bool, Optional[float]]:
+        """Returns ``(improves, revised_score)``. ``improves`` is True iff
+        `revised` is judged better than `original` by the tag verifier;
+        ``revised_score`` is the revised answer's verified score (None when not
+        accepted / not scorable), threaded out so ``_parallel`` can record the
+        post-refinement score in the FINAL synthesis event. Synthetic, DISTINCT
+        model names keep the heuristic/judge
         verifier from collapsing the two texts into one model bucket; sentinel
         sample_idx values (-1 revised, -2 original) make them identifiable
         after re-scoring.
@@ -718,7 +768,7 @@ class FleetRouter:
             rev = self._score_for(fwd, -1)
             orig = self._score_for(fwd, -2)
             if not (rev > orig):
-                return False
+                return False, None
             # Swap order: an order-dependent symmetric tie flips here, so only a
             # genuine non-symmetric preference survives both passes.
             swp = await self._verifier_synth.score_candidates(
@@ -726,7 +776,9 @@ class FleetRouter:
             )
             rev_sw = self._score_for(swp, -1)
             orig_sw = self._score_for(swp, -2)
-            return rev_sw > orig_sw
+            if rev_sw > orig_sw:
+                return True, rev
+            return False, None
 
         cands = [revised_cand, original_cand]
         if tag == "math":
@@ -737,8 +789,11 @@ class FleetRouter:
         if not ok:
             # Judge == critic and no neutral judge available → don't trust a
             # self-graded score; keep the original.
-            return False
-        return self._score_for(vres, -1) > self._score_for(vres, -2)
+            return False, None
+        rev_score = self._score_for(vres, -1)
+        if rev_score > self._score_for(vres, -2):
+            return True, rev_score
+        return False, None
 
     @staticmethod
     def _score_for(vres: VerificationResult, sample_idx: int) -> float:

@@ -330,6 +330,134 @@ async def test_compare_legacy_baseline_falls_back_with_warning(tmp_path, caplog)
     assert any("predates paired gating" in r.message for r in caplog.records)
 
 
+# --------------------------------------------------------------------------- #
+# Abstention capture via the event bus + separation (Part C)
+# --------------------------------------------------------------------------- #
+
+
+class _EventRouter:
+    """Stub fleet-like router with an event bus. ask() emits a
+    ResponseSynthesized carrying a per-prompt (winner_score, abstain), exactly
+    as the real router does on the verifier path — so the harness can capture
+    calibration signal without Ollama."""
+
+    def __init__(self, plan: dict):
+        from fleet.events import EventBus
+        self._events = EventBus()
+        self._plan = plan  # prompt -> (answer, winner_score, abstain)
+
+    async def ask(self, prompt: str):
+        from fleet.events import ResponseSynthesized
+        answer, winner_score, abstain = self._plan[prompt]
+        self._events.emit(ResponseSynthesized(
+            tag="math", mode="verifier",
+            winner_model=None if abstain else "m",
+            winner_score=winner_score, abstain=abstain,
+        ))
+        return answer
+
+
+@pytest.mark.asyncio
+async def test_run_eval_detailed_captures_winner_score_and_abstain():
+    cases = [
+        EvalCase(prompt="ans", tag="math", expected=42),
+        EvalCase(prompt="abs", tag="math", expected=42),
+    ]
+    router = _EventRouter({
+        "ans": ("answer 0", 0.45, False),          # answered, wrong
+        "abs": ("the answer is 42", None, True),    # abstained (dump happens to contain 42)
+    })
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()})
+    by_prompt = {pc.prompt: pc for pc in per_case}
+    assert by_prompt["ans"].winner_scores == [0.45]
+    assert by_prompt["ans"].abstained == [False]
+    assert by_prompt["abs"].winner_scores == [None]
+    assert by_prompt["abs"].abstained == [True]
+
+
+@pytest.mark.asyncio
+async def test_abstained_dump_not_counted_in_selective_accuracy():
+    """The key fix: an abstained case whose dump string accidentally SCORES AS
+    PASS must not inflate selective accuracy. Legacy pass_rate still counts it
+    (unchanged), but selective_accuracy is measured over answered only."""
+    cases = [
+        EvalCase(prompt="ans", tag="math", expected=42),
+        EvalCase(prompt="abs", tag="math", expected=42),
+    ]
+    router = _EventRouter({
+        "ans": ("answer 0", 0.45, False),         # answered + WRONG
+        "abs": ("the answer is 42", None, True),  # abstained + dump scores PASS
+    })
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()})
+    agg = aggregate_per_case(per_case)["math"]
+    # Legacy keys unchanged: the abstained dump's pass still shows up here.
+    assert agg["pass_rate"] == 0.5
+    # Calibration view excludes the abstention entirely.
+    assert agg["answered"] == 1
+    assert agg["abstained"] == 1
+    assert agg["coverage"] == 0.5
+    assert agg["abstention_rate"] == 0.5
+    assert agg["selective_accuracy"] == 0.0  # the one answered case was wrong
+
+
+@pytest.mark.asyncio
+async def test_stub_router_without_events_degrades_gracefully():
+    """A non-fleet stub (no _events) records no calibration data: everything
+    counts as answered, so legacy behavior is preserved exactly."""
+    cases = [EvalCase(prompt="math1", tag="math", expected=42)]
+    router = _StubRouter({"math1": "answer 42"})
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()})
+    pc = per_case[0]
+    assert pc.winner_scores == [None]
+    assert pc.abstained == [False]
+    agg = aggregate_per_case(per_case)["math"]
+    assert agg["coverage"] == 1.0
+    assert agg["abstention_rate"] == 0.0
+    assert agg["selective_accuracy"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_calibration_records_adapter_flattens_repeats():
+    from evals.runner import calibration_records
+    cases = [EvalCase(prompt="ans", tag="math", expected=42)]
+    router = _EventRouter({"ans": ("answer 42", 0.8, False)})
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()}, repeats=2)
+    recs = calibration_records(per_case)
+    assert len(recs) == 2
+    assert all(r.tag == "math" and r.winner_score == 0.8 for r in recs)
+    assert all(r.correct and not r.abstained for r in recs)
+    # Answered rows carry a real correctness measurement.
+    assert all(r.correct_known for r in recs)
+
+
+@pytest.mark.asyncio
+async def test_calibration_records_marks_live_abstentions_unknown():
+    """FIX 3: live abstained rows are flagged correct_known=False, so
+    calibrate() reports abstention_precision as 'not measured' rather than a
+    fabricated ~1.0 derived from the abstention-dump string's score."""
+    from evals.runner import calibration_records
+    from evals.calibrate import calibrate
+
+    cases = [EvalCase(prompt="abs", tag="math", expected=42)]
+    # Abstention dump happens to contain "42" so the scorer would mark it
+    # "correct" — exactly the misleading signal we must NOT feed as precision.
+    router = _EventRouter({"abs": ("the answer is 42", None, True)})
+    per_case = await run_eval_detailed(
+        router, cases, {"math": NumericMatchScorer()}, repeats=3
+    )
+    recs = calibration_records(per_case)
+    assert len(recs) == 3
+    abstained = [r for r in recs if r.abstained]
+    assert len(abstained) == 3
+    # Abstained rows are flagged unknown despite the dump scoring as "correct".
+    assert all(not r.correct_known for r in abstained)
+
+    tc = calibrate(recs).per_tag["math"]
+    assert tc.n_abstained == 3
+    assert tc.abstention_precision is None
+    assert tc.abstention_precision_display() == "n/a (not measured on live eval data)"
+
+
 @pytest.mark.asyncio
 async def test_run_and_report_threads_repeats_and_reports_significance(tmp_path):
     # Fixtures

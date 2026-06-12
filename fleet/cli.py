@@ -54,6 +54,12 @@ def _build_parser() -> argparse.ArgumentParser:
              "significance gate (default 1)",
     )
     parser.add_argument(
+        "--calibrate", default=None, metavar="OUT.yaml",
+        help="Eval mode only: fit per-tag abstention thresholds from this "
+             "run's outcomes and write the config-ready block to OUT.yaml "
+             "(use with --repeats to gather enough observations per tag)",
+    )
+    parser.add_argument(
         "--serve", action="store_true",
         help="Launch Anthropic-compatible HTTP proxy (use with Claude Code)",
     )
@@ -161,6 +167,18 @@ def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
         "repeats": repeats,
         "aggregates": aggregates,
     }, indent=2))
+
+    if getattr(args, "calibrate", None):
+        from evals.calibrate import calibrate, write_thresholds
+        from evals.runner import calibration_records
+
+        result = calibrate(calibration_records(per_case))
+        write_thresholds(result, args.calibrate)
+        print(json.dumps({"calibration": result.summary()}, indent=2))
+        print(
+            f"\nabstention thresholds written to {args.calibrate}",
+            file=sys.stderr,
+        )
 
     if args.save_baseline:
         save_baseline(aggregates, args.save_baseline, per_case=per_case)

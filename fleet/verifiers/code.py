@@ -141,15 +141,29 @@ class CodeVerifier:
         # reach the sandbox, but the sandbox is what actually contains risk.
         dangerous, why = _has_dangerous_pattern(tree)
         if dangerous:
-            return candidate.with_score(0.5, f"parses; unsafe ({why}); not executing")
+            # Dangerous-but-parseable code scores BELOW the static band floor
+            # (0.30) so it can NEVER outrank a clean parseable candidate, and
+            # below the default 0.4 abstention threshold so a lone dangerous
+            # answer abstains by default rather than being returned. Still
+            # strictly above the 0.0 syntax-error score (it does parse).
+            # Ordering invariant maintained end-to-end:
+            #   syntax_error 0.0 < dangerous 0.20 < static band [0.30, 0.58]
+            #   < execution (runtime-error 0.6, clean 1.0).
+            return candidate.with_score(
+                0.20, f"parses; unsafe ({why}); not executing"
+            )
 
-        # Distributed scoring when execution is OFF (the default). The
-        # previous implementation gave all-parse-with-defs candidates the
-        # same ~0.7 score, which (a) collapsed bandit signal and (b) sat
-        # exactly above the escalation threshold so EVERY code prompt
-        # triggered escalation. Spreading multiple weak signals across
-        # 0.50–0.85 lets candidates differentiate while keeping room for
-        # an "executes cleanly" candidate to win at 1.0 when execute=True.
+        # Distributed scoring when execution is OFF (the default). The static
+        # band is [0.30, 0.58]: a bare-but-parseable answer starts at 0.30 and
+        # each discriminating signal adds 0.04. The band sits ENTIRELY BELOW
+        # the execution band (runtime-error 0.6, clean 1.0) so an executed
+        # candidate always outranks any static one, and ENTIRELY ABOVE the
+        # dangerous-but-parseable sentinel (0.20) so flagged-dangerous code can
+        # never outrank a clean candidate. AND — critically — a
+        # bare-AST-valid-but-low-quality answer can now land below a calibrated
+        # abstention threshold. The previous floor of 0.50 made any per-tag
+        # code threshold below 0.50 unreachable, so abstention could never fire
+        # on parseable-but-weak code; widening the band restores that lever.
         # AST-only scoring whenever execution is not actually enabled — either
         # execute=False, or execute=True with no configured sandbox (in which
         # case we DO NOT run the code; see the constructor warning).
@@ -164,11 +178,28 @@ class CodeVerifier:
         return candidate.with_score(exec_score, f"parses; {exec_note}")
 
     def _distributed_static_score(self, tree: ast.AST, code: str) -> tuple[float, str]:
-        """0.50 base for parsing, +0.05 per discriminating signal, capped
-        at 0.85 so an executes-cleanly candidate can still beat any
-        static winner. Goal: spread candidates across the score range so
-        the bandit gets real signal AND escalation only fires for
-        genuine uncertainty (not on every code prompt)."""
+        """0.30 base for parsing, +0.04 per discriminating signal, capped at
+        0.58. Rationale for the [0.30, 0.58] band:
+
+        - Floor 0.30 (not the old 0.50) lets a bare-AST-valid-but-low-quality
+          answer (e.g. a `pass`-only stub) score below a calibrated abstention
+          threshold, so per-tag code abstention can actually fire. The old
+          0.50 floor made any cut-point below 0.50 a dead lever.
+        - Ceiling 0.58 stays STRICTLY BELOW the execution band (runtime-error
+          0.6, clean 1.0), so any executed candidate beats every static one —
+          execution remains the dominant, trusted signal.
+        - +0.04 per signal preserves the relative ordering (more signals ⇒
+          higher score) so the bandit still gets graded, discriminative signal.
+
+        A normal multi-signal answer (defines + returns + non-trivial body +
+        reasonable length, ± documented/typed) lands ~0.42–0.58 — comfortably
+        above the default 0.4 — so ordinary valid code does NOT abstain by
+        default; only genuinely threadbare answers dip below."""
+        # Conscious tradeoff: a short, imperative, print-only answer (e.g. a
+        # 2-line script with no defs/returns) collects few signals and can land
+        # below the default 0.4 threshold, so it abstains by default. We accept
+        # that — correct one-liners are cheap to re-ask, and the false-abstain
+        # cost is lower than returning unverifiable threadbare code as a winner.
         signals: list[str] = []
 
         nodes = list(ast.walk(tree))
@@ -207,8 +238,8 @@ class CodeVerifier:
         if 3 <= line_count <= 200:
             signals.append("reasonable length")
 
-        score = 0.50 + 0.05 * len(signals)
-        score = min(score, 0.85)
+        score = 0.30 + 0.04 * len(signals)
+        score = min(score, 0.58)
         return score, "; ".join(["parses", *signals])
 
     def _build_sandbox_argv(self, file_path: str, workdir: str) -> list[str]:

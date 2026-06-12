@@ -87,7 +87,16 @@ class SynthesisConfig:
     # JudgeVerifier not registered, falls through to HeuristicVerifier.
     judge_model: str = ""
     # Verifier-set winner.score below this triggers calibrated abstention.
+    # This is the DEFAULT/fallback applied to any tag without a per-tag
+    # override below.
     abstention_threshold: float = 0.4
+    # Per-tag abstention threshold overrides. Score scales are INCOMMENSURABLE
+    # across verifiers (judge x/10 → [0,1], math agreement fractions, code
+    # static-band scores), so one global 0.4 can't be calibrated for all tags.
+    # A tag listed here uses its own threshold; everything else falls back to
+    # `abstention_threshold`. Empty (default) ⇒ every tag uses 0.4, exactly the
+    # historical behavior. Populate it from `evals.calibrate` fitted outcomes.
+    abstention_thresholds: dict[str, float] = field(default_factory=dict)
     # Swap-order consistency for the LLM judge: run the judge twice (given
     # order + reversed) and average per-candidate scores to cancel position
     # bias. ON by default (quality-first); OFF reverts to a single pass.
@@ -247,6 +256,27 @@ def _coerce_float(raw: Any, default: float) -> float:
         return default
 
 
+def _coerce_threshold_map(raw: Any) -> dict[str, float]:
+    """Coerce a per-tag abstention-threshold mapping. Keys must be strings,
+    values must parse to a float and are clamped to [0, 1]. Junk keys (non-str)
+    and junk values (non-numeric / NaN) are dropped silently — a misconfigured
+    entry must never widen or disable abstention for a tag by accident."""
+    out: dict[str, float] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f != f:  # NaN
+            continue
+        out[k] = min(1.0, max(0.0, f))
+    return out
+
+
 def load_config(path: Path | str | None = None) -> Config:
     """Resolve a config file: explicit path > ~/.fleet/config.yaml > bundled
     fleet/config.yaml > built-in defaults."""
@@ -365,6 +395,7 @@ def load_config(path: Path | str | None = None) -> Config:
         mode=syn_mode,
         judge_model=str(syn_raw.get("judge_model", "")),
         abstention_threshold=_coerce_float(syn_raw.get("abstention_threshold"), 0.4),
+        abstention_thresholds=_coerce_threshold_map(syn_raw.get("abstention_thresholds")),
         judge_swap_order=bool(syn_raw.get("judge_swap_order", True)),
         code_execute=bool(syn_raw.get("code_execute", False)),
         code_execute_timeout=_coerce_int(syn_raw.get("code_execute_timeout"), 5),

@@ -42,6 +42,67 @@ async def test_synthesizer_abstains_below_threshold():
     assert result.winner is None
 
 
+# --------------------------------------------------------------------------- #
+# Per-tag abstention thresholds (incommensurable-scales fix)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_per_tag_threshold_abstains_where_default_would_accept():
+    """A per-tag threshold of 0.6 makes a 0.5 winner abstain on that tag, even
+    though the global default of 0.4 would have accepted it."""
+    reg = VerifierRegistry()
+    reg.register(_FixedScoreVerifier("math", winner_idx=0, scores=[0.5, 0.3]))
+    s = VerifierSynthesizer(
+        reg,
+        abstention_threshold=0.4,
+        abstention_thresholds={"math": 0.6, "code": 0.55},
+    )
+    result = await s.pick("p", {"a": ["x"], "b": ["y"]}, "math")
+    assert result.abstain
+    assert result.winner is None
+
+
+@pytest.mark.asyncio
+async def test_per_tag_threshold_unlisted_tag_uses_default():
+    """A tag absent from the override map uses the global default unchanged: a
+    0.5 winner clears the 0.4 default and is accepted."""
+    reg = VerifierRegistry()
+    reg.register(_FixedScoreVerifier("reasoning", winner_idx=0, scores=[0.5, 0.3]))
+    s = VerifierSynthesizer(
+        reg,
+        abstention_threshold=0.4,
+        abstention_thresholds={"math": 0.6},  # reasoning not listed
+    )
+    result = await s.pick("p", {"a": ["x"], "b": ["y"]}, "reasoning")
+    assert not result.abstain
+    assert result.winner is not None
+    assert result.winner.score == 0.5
+
+
+@pytest.mark.asyncio
+async def test_empty_override_map_reproduces_default_behavior():
+    """Empty override map ⇒ every tag uses the global default exactly as
+    before (regression guard for the default path)."""
+    reg = VerifierRegistry()
+    reg.register(_FixedScoreVerifier("math", winner_idx=0, scores=[0.5]))
+    s = VerifierSynthesizer(reg, abstention_threshold=0.4, abstention_thresholds={})
+    result = await s.pick("p", {"a": ["x"]}, "math")
+    assert not result.abstain
+    assert result.winner is not None
+
+
+def test_abstention_threshold_for_resolves_override_then_default():
+    s = VerifierSynthesizer(
+        VerifierRegistry(),
+        abstention_threshold=0.4,
+        abstention_thresholds={"math": 0.6},
+    )
+    assert s.abstention_threshold_for("math") == 0.6
+    assert s.abstention_threshold_for("code") == 0.4   # falls back
+    assert s.abstention_threshold_for(None) == 0.4     # direct/no-tag path
+
+
 @pytest.mark.asyncio
 async def test_synthesizer_flattens_samples_per_model():
     """N samples per model become N candidates."""

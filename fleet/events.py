@@ -65,6 +65,16 @@ class EventBus:
     def subscribe(self, sink: Sink) -> None:
         self._sinks.append(sink)
 
+    def unsubscribe(self, sink: Sink) -> None:
+        """Remove a previously-subscribed sink. No-op if it isn't subscribed.
+        Lets a short-lived consumer (e.g. the eval harness's calibration
+        collector) attach for one run and detach cleanly afterwards instead of
+        accumulating stale sinks on a long-lived router's bus."""
+        try:
+            self._sinks.remove(sink)
+        except ValueError:
+            pass
+
     def emit(self, event: RouterEvent) -> None:
         for sink in self._sinks:
             try:

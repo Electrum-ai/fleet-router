@@ -88,6 +88,16 @@ class PerCaseResult:
 
     ``mean_score`` feeds the bootstrap delta; ``passed`` (mean >= 0.5) feeds
     McNemar's pass/fail projection.
+
+    ``winner_scores`` and ``abstained`` are per-repeat (parallel to ``scores``)
+    and are populated from the router's ``ResponseSynthesized`` events when the
+    router exposes an event bus. They carry the calibration signal: the
+    verifier-chosen winner score and whether the case abstained, so the eval
+    harness can separate genuine answers from abstention dumps instead of
+    scoring the "(uncertain — …)" string as if it were an answer. A repeat with
+    no event (non-fleet stub router, or the heuristic fast path) records
+    ``winner_score=None`` / ``abstained=False`` — graceful degradation with no
+    calibration data rather than a crash.
     """
 
     case: EvalCase
@@ -97,10 +107,23 @@ class PerCaseResult:
     scores: list[float] = field(default_factory=list)
     answers: list[str] = field(default_factory=list)
     notes: str = ""
+    winner_scores: list[Optional[float]] = field(default_factory=list)
+    abstained: list[bool] = field(default_factory=list)
 
     @property
     def mean_score(self) -> float:
         return sum(self.scores) / len(self.scores) if self.scores else 0.0
+
+    @property
+    def answered_scores(self) -> list[float]:
+        """Scores for repeats that did NOT abstain — what selective accuracy is
+        measured over. Falls back to all scores when no abstention data exists
+        (e.g. a stub router with no event bus), preserving legacy behavior."""
+        if not self.abstained:
+            return list(self.scores)
+        return [
+            s for s, ab in zip(self.scores, self.abstained) if not ab
+        ]
 
     @property
     def pass_fraction(self) -> float:
@@ -160,6 +183,66 @@ async def _answer_to_str(router, prompt: str) -> str:
     return str(answer)
 
 
+class _SynthesisCollector:
+    """Captures the LAST ResponseSynthesized event emitted on a router's event
+    bus during an ask(), so each eval case can be paired with the verifier's
+    winner_score and abstain flag. Reset() before each ask() clears stale
+    carry-over, so a case that emits no synthesis event records (None, False)
+    rather than the previous case's outcome.
+
+    The router emits its synthesis event ONCE, reflecting the FINAL returned
+    outcome — i.e. AFTER any escalation/refinement post-pass (see
+    ``FleetRouter._parallel``). That makes the last event the collector sees
+    match what ask() actually returns: an escalation-rescued case (verifier
+    abstained, then a stronger model produced a verified answer) is recorded as
+    ANSWERED with the escalated score, not as an abstention. This pairing is
+    therefore reliable end-to-end; calibration no longer overcounts abstention
+    on the tags where escalation does the most work.
+
+    Subscribes only when the router exposes an EventBus-like ``_events``
+    attribute; otherwise stays inert and the harness degrades to no
+    calibration data (legacy behavior)."""
+
+    def __init__(self, router) -> None:
+        self._bus = getattr(router, "_events", None)
+        self.winner_score: Optional[float] = None
+        self.abstained: bool = False
+        self.tag: Optional[str] = None
+        self._active = bool(
+            self._bus is not None
+            and hasattr(self._bus, "subscribe")
+            and hasattr(self._bus, "unsubscribe")
+        )
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def __enter__(self) -> "_SynthesisCollector":
+        if self._active:
+            self._bus.subscribe(self._sink)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._active:
+            self._bus.unsubscribe(self._sink)
+
+    def reset(self) -> None:
+        self.winner_score = None
+        self.abstained = False
+        self.tag = None
+
+    def _sink(self, event) -> None:
+        # Imported lazily so evals.runner doesn't hard-depend on fleet internals
+        # for the stub-router code paths exercised in unit tests.
+        from fleet.events import ResponseSynthesized
+
+        if isinstance(event, ResponseSynthesized):
+            self.winner_score = event.winner_score
+            self.abstained = bool(event.abstain)
+            self.tag = event.tag or None
+
+
 def _resolve_scorer(case: EvalCase, scorers: dict[str, Scorer]) -> Optional[Scorer]:
     scorer = scorers.get(case.scorer) if case.scorer else None
     if scorer is None:
@@ -183,30 +266,44 @@ async def run_eval_detailed(
         raise ValueError(f"repeats must be >= 1, got {repeats}")
     scorers = scorers or default_scorers()
     out: list[PerCaseResult] = []
-    for case in cases:
-        scorer = _resolve_scorer(case, scorers)
-        if scorer is None:
-            logger.warning("no scorer for tag=%s scorer=%s; skipping case",
-                           case.tag, case.scorer)
-            continue
-        scores: list[float] = []
-        answers: list[str] = []
-        notes = ""
-        for _ in range(repeats):
-            answer = await _answer_to_str(router, case.prompt)
-            result = await scorer.score(case, answer)
-            scores.append(result.score)
-            answers.append(result.answer)
-            notes = result.notes
-        out.append(PerCaseResult(
-            case=case,
-            id=case_id(case.tag, case.prompt),
-            tag=case.tag,
-            prompt=case.prompt,
-            scores=scores,
-            answers=answers,
-            notes=notes,
-        ))
+    with _SynthesisCollector(router) as collector:
+        for case in cases:
+            scorer = _resolve_scorer(case, scorers)
+            if scorer is None:
+                logger.warning("no scorer for tag=%s scorer=%s; skipping case",
+                               case.tag, case.scorer)
+                continue
+            scores: list[float] = []
+            answers: list[str] = []
+            winner_scores: list[Optional[float]] = []
+            abstained: list[bool] = []
+            notes = ""
+            for _ in range(repeats):
+                collector.reset()
+                answer = await _answer_to_str(router, case.prompt)
+                result = await scorer.score(case, answer)
+                scores.append(result.score)
+                answers.append(result.answer)
+                # Pair the scorer outcome with the verifier's synthesis event.
+                # An abstained repeat is recorded AS an abstention so downstream
+                # selective-accuracy/calibration never treats the abstention
+                # dump string as a graded answer.
+                winner_scores.append(
+                    collector.winner_score if collector.active else None
+                )
+                abstained.append(collector.abstained if collector.active else False)
+                notes = result.notes
+            out.append(PerCaseResult(
+                case=case,
+                id=case_id(case.tag, case.prompt),
+                tag=case.tag,
+                prompt=case.prompt,
+                scores=scores,
+                answers=answers,
+                notes=notes,
+                winner_scores=winner_scores,
+                abstained=abstained,
+            ))
     return out
 
 
@@ -254,8 +351,25 @@ def aggregate(results: list[EvalResult]) -> dict[str, dict]:
 
 
 def aggregate_per_case(per_case: list[PerCaseResult]) -> dict[str, dict]:
-    """Aggregate per-case records by tag — same shape as ``aggregate`` but
-    sourced from the rich records (uses each case's mean across repeats)."""
+    """Aggregate per-case records by tag.
+
+    Legacy keys (``n``, ``mean_score``, ``pass_rate``) are UNCHANGED — they are
+    case-level (each case's mean across repeats) and feed the paired regression
+    gate exactly as before.
+
+    Calibration keys are added alongside and are computed at the OBSERVATION
+    (per-repeat) level, separating each repeat into answered vs abstained:
+
+    - ``coverage``           = answered observations / total observations
+    - ``selective_accuracy`` = pass-rate (score >= 0.5) among ANSWERED only
+    - ``abstention_rate``    = abstained observations / total observations
+    - ``answered``/``abstained`` = the raw observation counts
+
+    When a tag carries no abstention data (stub router with no event bus), every
+    observation counts as answered: coverage 1.0, abstention_rate 0.0, and
+    selective_accuracy is just the per-observation pass rate — so legacy runs
+    are unaffected.
+    """
     by_tag: dict[str, list[PerCaseResult]] = {}
     for pc in per_case:
         by_tag.setdefault(pc.tag, []).append(pc)
@@ -263,12 +377,69 @@ def aggregate_per_case(per_case: list[PerCaseResult]) -> dict[str, dict]:
     for tag, pcs in by_tag.items():
         means = [pc.mean_score for pc in pcs]
         passes = sum(1 for pc in pcs if pc.passed)
+
+        total_obs = 0
+        abstained_obs = 0
+        answered_correct = 0
+        answered_obs = 0
+        for pc in pcs:
+            for i, s in enumerate(pc.scores):
+                total_obs += 1
+                is_abstain = pc.abstained[i] if i < len(pc.abstained) else False
+                if is_abstain:
+                    abstained_obs += 1
+                else:
+                    answered_obs += 1
+                    if s >= 0.5:
+                        answered_correct += 1
         out[tag] = {
             "n": len(pcs),
             "mean_score": sum(means) / len(means),
             "pass_rate": passes / len(pcs),
+            # calibration (observation-level)
+            "answered": answered_obs,
+            "abstained": abstained_obs,
+            "coverage": (answered_obs / total_obs) if total_obs else 0.0,
+            "selective_accuracy": (
+                answered_correct / answered_obs if answered_obs else 0.0
+            ),
+            "abstention_rate": (
+                abstained_obs / total_obs if total_obs else 0.0
+            ),
         }
     return out
+
+
+def calibration_records(per_case: list[PerCaseResult]):
+    """Flatten per-case records into one ``CalibrationRecord`` per repeat for
+    ``evals.calibrate``. Each repeat is an independent observation: its
+    verifier winner_score, whether the scored answer was correct (score >=
+    0.5), and whether it abstained. Abstained repeats carry winner_score=None
+    and are excluded from threshold fitting (recorded as abstentions).
+
+    For an ABSTAINED repeat the per-repeat score ``s`` is the scorer's grade of
+    the abstention-DUMP string, NOT of the suppressed best candidate — so it is
+    not a real measurement of "was abstaining correct?". Such rows are flagged
+    ``correct_known=False`` so ``calibrate`` reports abstention_precision as
+    "not measured" rather than collapsing it to a fabricated ~1.0. Answered rows
+    carry a real measurement (``correct_known=True``)."""
+    from evals.calibrate import CalibrationRecord
+
+    recs = []
+    for pc in per_case:
+        for i, s in enumerate(pc.scores):
+            ws = pc.winner_scores[i] if i < len(pc.winner_scores) else None
+            ab = pc.abstained[i] if i < len(pc.abstained) else False
+            recs.append(CalibrationRecord(
+                tag=pc.tag,
+                winner_score=ws,
+                # Abstained rows: the score is of the dump string, not the
+                # suppressed candidate → correctness is unknown for precision.
+                correct=(s >= 0.5),
+                abstained=ab,
+                correct_known=not ab,
+            ))
+    return recs
 
 
 def save_baseline(
@@ -515,11 +686,25 @@ async def run_and_report(
         for pc in per_case
     ]
     aggregates = aggregate(results)
+    # Observation-level calibration view (coverage / selective accuracy /
+    # abstention rate per tag), sourced from the rich per-case records.
+    cal_agg = aggregate_per_case(per_case)
+    calibration = {
+        tag: {
+            k: v[k]
+            for k in (
+                "answered", "abstained", "coverage",
+                "selective_accuracy", "abstention_rate",
+            )
+        }
+        for tag, v in cal_agg.items()
+    }
     report: dict = {
         "n_cases": len(cases),
         "repeats": repeats,
         "elapsed_s": elapsed,
         "aggregates": aggregates,
+        "calibration": calibration,
         "per_case": [
             {
                 "id": pc.id,

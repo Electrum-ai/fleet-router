@@ -40,6 +40,16 @@ synthesis:
   # Strongest model arbitrates judge-based tags (reasoning, creative, …).
   judge_model: deepseek-v4-pro
   abstention_threshold: 0.4
+  # Per-tag overrides for the abstention cut-point. Verifier score scales are
+  # INCOMMENSURABLE across tags (judge x/10 → [0,1], math agreement fractions,
+  # code static band), so one global 0.4 can't be calibrated for all. Tags
+  # listed here use their own threshold; everything else falls back to
+  # abstention_threshold above. Empty (default) ⇒ historical single-threshold
+  # behavior. Fit these from real outcomes with:
+  #   fleet --eval evals/fixtures --repeats 5 --calibrate thresholds.yaml
+  # abstention_thresholds:
+  #   math: 0.6
+  #   code: 0.55
   # OFF for security: running LLM-generated code is a real RCE vector.
   code_execute: false
   code_execute_timeout: 5

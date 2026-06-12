@@ -25,9 +25,26 @@ class VerifierSynthesizer:
         self,
         registry: Optional[VerifierRegistry] = None,
         abstention_threshold: float = DEFAULT_ABSTENTION_THRESHOLD,
+        abstention_thresholds: Optional[dict[str, float]] = None,
     ):
         self._registry = registry or VerifierRegistry()
+        # Global fallback threshold + incommensurable-scale per-tag overrides.
+        # Verifier score scales differ by tag (judge x/10 → [0,1], math
+        # agreement fractions, code static band), so one global cut-point can't
+        # be calibrated for all of them. A tag absent from the override map
+        # falls back to `abstention_threshold` — so an empty map reproduces the
+        # exact historical single-threshold behavior.
         self._abstention_threshold = abstention_threshold
+        self._abstention_thresholds = dict(abstention_thresholds or {})
+
+    def abstention_threshold_for(self, task_tag: Optional[str]) -> float:
+        """The abstention cut-point that applies to `task_tag`: its per-tag
+        override if configured, else the global default. Exposed so the router
+        can make tag-aware escalation decisions on the same threshold the
+        synthesizer would have used."""
+        if task_tag is None:
+            return self._abstention_threshold
+        return self._abstention_thresholds.get(task_tag, self._abstention_threshold)
 
     def verifier_for(self, task_tag: str):
         """Resolve the Verifier that will score `task_tag` (post-fallback).
@@ -71,7 +88,7 @@ class VerifierSynthesizer:
         verifier = self._registry.for_tag(task_tag)
         result = await verifier.aggregate(prompt, candidates)
 
-        return self._apply_abstention(result)
+        return self._apply_abstention(result, task_tag)
 
     async def score_candidates(
         self,
@@ -97,11 +114,13 @@ class VerifierSynthesizer:
         return await verifier.aggregate(prompt, candidates)
 
     def _apply_abstention(
-        self, result: VerificationResult
+        self, result: VerificationResult, task_tag: Optional[str] = None
     ) -> VerificationResult:
         # Calibrated abstention: even if verifier picked a winner, abstain
-        # when the winner's score is below threshold. Verifier-set
-        # `abstain=True` always wins (verifier knows best).
+        # when the winner's score is below the threshold that applies to this
+        # tag. Verifier-set `abstain=True` always wins (verifier knows best).
+        # `task_tag=None` (e.g. direct unit-test calls) uses the global default.
+        threshold = self.abstention_threshold_for(task_tag)
         if result.abstain:
             return result
         if result.winner is None:
@@ -114,12 +133,12 @@ class VerifierSynthesizer:
                 # even on abstain) never ingests judge-failure noise.
                 scores_reliable=result.scores_reliable,
             )
-        if result.winner.score < self._abstention_threshold:
+        if result.winner.score < threshold:
             return VerificationResult(
                 winner=None, all_scored=result.all_scored,
                 rationale=(
                     f"winner score {result.winner.score:.2f} below threshold "
-                    f"{self._abstention_threshold}; abstaining"
+                    f"{threshold}; abstaining"
                 ),
                 abstain=True,
                 scores_reliable=result.scores_reliable,
