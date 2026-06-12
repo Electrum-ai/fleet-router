@@ -299,3 +299,143 @@ async def test_refinement_swaps_away_from_winning_model():
             f"refinement called {call[0][1]}, but winner was the critic — "
             "self-critique would bias toward 'looks good'"
         )
+
+
+# ---------- chain-of-thought leak regression guards (BUG 1) ----------
+
+
+@pytest.mark.asyncio
+async def test_thinking_never_leaks_into_returned_winner():
+    """A reasoning-style candidate with a <thinking> block must have its
+    chain-of-thought stripped before the winner is returned to the user."""
+    config = Config(
+        models={"model-a": ModelEntry(tags=["math"], priority=1),
+                "model-b": ModelEntry(tags=["math"], priority=2)},
+        synthesis=SynthesisConfig(mode="verifier"),
+        sampling=SamplingConfig(samples_by_tag={"math": 1, "default": 1}),
+    )
+    router = FleetRouter(config)
+    router._registry._available = {"model-a", "model-b"}
+    router._registry._refreshed = True
+
+    with patch.object(router._classifier, "classify", return_value=("math", 0.4)), \
+         patch.object(router._dispatcher, "run_multi", new_callable=AsyncMock) as mock_multi:
+        mock_multi.return_value = {
+            "model-a": ["<thinking>secret reasoning 6*7</thinking>The answer is 42."],
+            "model-b": ["The answer is 42."],
+        }
+        result = await router.ask("what is 6*7")
+    assert "<thinking>" not in result
+    assert "secret reasoning" not in result
+    assert "42" in result
+
+
+@pytest.mark.asyncio
+async def test_thinking_never_leaks_into_abstention_dump():
+    """The calibrated-abstention summary dumps candidate text — it must dump
+    the stripped final answers, never the raw <thinking> reasoning."""
+    config = Config(
+        models={"model-a": ModelEntry(tags=["math"], priority=1),
+                "model-b": ModelEntry(tags=["math"], priority=2),
+                "model-c": ModelEntry(tags=["math"], priority=3)},
+        synthesis=SynthesisConfig(mode="verifier"),
+        sampling=SamplingConfig(samples_by_tag={"math": 1, "default": 1}),
+    )
+    router = FleetRouter(config)
+    router._registry._available = {"model-a", "model-b", "model-c"}
+    router._registry._refreshed = True
+
+    with patch.object(router._classifier, "classify", return_value=("math", 0.4)), \
+         patch.object(router._dispatcher, "run_multi", new_callable=AsyncMock) as mock_multi:
+        mock_multi.return_value = {
+            "model-a": ["<thinking>secret-a</thinking>The answer is 10."],
+            "model-b": ["<thinking>secret-b</thinking>The answer is 20."],
+            "model-c": ["<thinking>secret-c</thinking>The answer is 30."],
+        }
+        result = await router.ask("a hard problem")
+    assert "uncertain" in result  # abstention path
+    assert "<thinking>" not in result
+    for leak in ("secret-a", "secret-b", "secret-c"):
+        assert leak not in result
+
+
+@pytest.mark.asyncio
+async def test_thinking_never_leaks_into_escalation_prompt_or_answer():
+    config = Config(
+        models={"model-a": ModelEntry(tags=["math"], priority=1),
+                "model-b": ModelEntry(tags=["math"], priority=2),
+                "model-c": ModelEntry(tags=["math"], priority=3),
+                "judge": ModelEntry(tags=["math"], priority=4)},
+        synthesis=SynthesisConfig(mode="verifier"),
+        sampling=SamplingConfig(samples_by_tag={"math": 1, "default": 1}),
+        escalation=EscalationConfig(enabled=True, model="judge", score_threshold=0.6),
+    )
+    router = FleetRouter(config)
+    router._registry._available = {"model-a", "model-b", "model-c", "judge"}
+    router._registry._refreshed = True
+
+    with patch.object(router._classifier, "classify", return_value=("math", 0.4)), \
+         patch.object(router._dispatcher, "run_multi", new_callable=AsyncMock) as mock_multi, \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_run:
+        mock_multi.return_value = {
+            "model-a": ["<thinking>secret-a</thinking>The answer is 10."],
+            "model-b": ["<thinking>secret-b</thinking>The answer is 20."],
+            "model-c": ["<thinking>secret-c</thinking>The answer is 30."],
+        }
+        # The judge itself also emits a <thinking> block — its answer must be
+        # stripped on the way out too.
+        mock_run.return_value = {"judge": "<thinking>weighing options</thinking>42 is correct"}
+        result = await router.ask("a hard problem")
+
+    # Escalation answer returned, stripped.
+    assert result == "42 is correct"
+    # The arbitration prompt embedded the stripped candidate texts only.
+    escalate_prompt = mock_run.call_args[0][0]
+    assert "<thinking>" not in escalate_prompt
+    for leak in ("secret-a", "secret-b", "secret-c"):
+        assert leak not in escalate_prompt
+
+
+@pytest.mark.asyncio
+async def test_thinking_stripped_from_refined_answer():
+    config = Config(
+        models={"model-a": ModelEntry(tags=["general"], priority=1),
+                "critic": ModelEntry(tags=["general"], priority=2)},
+        synthesis=SynthesisConfig(mode="verifier"),
+        sampling=SamplingConfig(samples_by_tag={"default": 1}),
+        refinement=RefinementConfig(enabled=True, critique_model="critic"),
+    )
+    router = FleetRouter(config)
+    router._registry._available = {"model-a", "critic"}
+    router._registry._refreshed = True
+
+    with patch.object(router._classifier, "classify", return_value=("general", 0.4)), \
+         patch.object(router._dispatcher, "run_multi", new_callable=AsyncMock) as mock_multi, \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_run, \
+         patch.object(router._verifier_synth, "pick", new_callable=AsyncMock) as mock_pick:
+        mock_multi.return_value = {"model-a": ["draft answer"]}
+        mock_pick.return_value = VerificationResult(
+            winner=Candidate("model-a", 0, "draft answer", score=0.8),
+            all_scored=[],
+        )
+        mock_run.side_effect = [
+            {"critic": "you forgot X"},
+            {"critic": "<thinking>let me rewrite</thinking>final revised answer with X"},
+        ]
+        result = await router.ask("explain")
+    assert result == "final revised answer with X"
+    assert "<thinking>" not in result
+
+
+@pytest.mark.asyncio
+async def test_thinking_stripped_from_force_model_path():
+    config = Config(models={"forced": ModelEntry(tags=["general"], priority=1)})
+    router = FleetRouter(config)
+    router._registry._available = {"forced"}
+    router._registry._refreshed = True
+
+    with patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_run:
+        mock_run.return_value = {"forced": "<think>secret</think>just the answer"}
+        result = await router.ask("hello", force_model="forced")
+    assert result == "just the answer"
+    assert "<think>" not in result

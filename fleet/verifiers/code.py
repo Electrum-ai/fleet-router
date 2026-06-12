@@ -15,12 +15,12 @@ import re
 import sys
 import tempfile
 
+from fleet.text import strip_thinking
 from fleet.verifiers.base import Candidate, VerificationResult, Verifier
 
 logger = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
-_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 
 # Modules / names blocklisted from execution. Conservative — false positives
 # are fine here, false negatives leak RCE.
@@ -32,10 +32,6 @@ _DANGEROUS_IMPORTS = {
 _DANGEROUS_CALLS = {
     "eval", "exec", "compile", "__import__", "open", "input",
 }
-
-
-def _strip(text: str) -> str:
-    return _THINK_RE.sub("", text).strip()
 
 
 def _extract_code(text: str) -> str:
@@ -98,7 +94,7 @@ class CodeVerifier:
         )
 
     async def _score_one(self, candidate: Candidate) -> Candidate:
-        code = _extract_code(_strip(candidate.text))
+        code = _extract_code(strip_thinking(candidate.text))
         if not code.strip():
             return candidate.with_score(0.0, "no code found")
 

@@ -7,12 +7,19 @@ from typing import Optional, Protocol, runtime_checkable
 
 @dataclass
 class Candidate:
-    """A single sampled response from one model."""
+    """A single sampled response from one model.
+
+    ``text`` is the chain-of-thought-stripped final answer — what scoring,
+    judge/escalation prompts, abstention summaries, and the returned winner all
+    consume. ``raw_text`` preserves the original generation (including any
+    ``<think>`` block) for the rare consumer that needs it.
+    """
     model: str
     sample_idx: int
     text: str
     score: float = 0.0
     notes: str = ""
+    raw_text: str = ""
 
     def with_score(self, score: float, notes: str = "") -> "Candidate":
         return replace(self, score=score, notes=notes or self.notes)

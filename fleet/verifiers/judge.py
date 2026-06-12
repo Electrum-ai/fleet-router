@@ -7,15 +7,13 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Optional
 
 from fleet.providers.base import GenerateRequest, Provider
+from fleet.text import strip_thinking
 from fleet.verifiers.base import Candidate, VerificationResult
 
 logger = logging.getLogger(__name__)
-
-_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 
 _RUBRICS: dict[str, str] = {
     "code": "Score by correctness, edge-case handling, idiomatic style, and runnability.",
@@ -43,10 +41,6 @@ Reply with ONLY this JSON object — no prose before or after:
 {{"scores": {{"A": 7, "B": 5}}, "best": "A", "rationale": "brief reason"}}"""
 
 
-def _strip(text: str) -> str:
-    return _THINK_RE.sub("", text).strip()
-
-
 def _extract_json(text: str) -> Optional[dict]:
     """Best-effort: find the first JSON object in text and parse it.
 
@@ -55,7 +49,7 @@ def _extract_json(text: str) -> Optional[dict]:
     depth counter and corrupt the slice. Without this, judge outputs
     that include braces in their explanation silently fail to parse and
     poison the bandit with the all-0.5 fallback path."""
-    text = _strip(text)
+    text = strip_thinking(text)
     # Try whole text first (model followed instructions).
     try:
         return json.loads(text)
@@ -134,7 +128,7 @@ class JudgeVerifier:
         labeled = dict(zip(labels, candidates))
 
         candidates_block = "\n\n".join(
-            f"--- Candidate {label} ---\n{_strip(c.text)}"
+            f"--- Candidate {label} ---\n{strip_thinking(c.text)}"
             for label, c in labeled.items()
         )
         judge_prompt = _JUDGE_PROMPT.format(

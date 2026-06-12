@@ -10,20 +10,77 @@ import re
 from collections import Counter
 from typing import Optional
 
+from fleet.text import strip_thinking
 from fleet.verifiers.base import Candidate, VerificationResult
 
-_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+# A numeric token. Two alternatives, tried left to right:
+#   1. comma-grouped integer/decimal: 1,234  /  1,234,567.5   (requires a comma
+#      group, so it never swallows the first 3 digits of a plain integer)
+#   2. plain integer/decimal with optional exponent: 42 / -3.5 / 1.5e3
+_NUM = (
+    r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?"          # comma-grouped
+    r"|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"       # plain / scientific
+)
+# Optional simple-fraction tail: "/ 2", "/-3.5".
+_FRACTION_TAIL = r"(?:\s*/\s*-?\d+(?:\.\d+)?)?"
 
-# Match "the answer is X", "answer: X", "X" at end of line, etc.
+# Explicit answer markers. The connector after the marker word allows an
+# optional "is" ("the answer is 42"), or ":"/"=" ("answer: 42", "answer=42"),
+# or nothing ("answer 42"). The capture supports comma grouping and simple
+# fractions so the marker path and the fallback path agree.
 _ANSWER_PATTERNS = [
-    re.compile(r"(?:final\s+answer|answer|result|equals?|=)\s*[:=]?\s*\$?(-?\d+(?:[.,]\d+)?(?:[eE][-+]?\d+)?)", re.IGNORECASE),
+    re.compile(
+        r"(?:final\s+answer|answer|result|equals?|=)"
+        r"\s*(?:is\s+|[:=]\s*)?\$?"
+        r"((?:" + _NUM + r")" + _FRACTION_TAIL + r")",
+        re.IGNORECASE,
+    ),
     re.compile(r"\\boxed\{([^}]+)\}"),
 ]
-_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+# Fallback scanner: same numeric token as the marker path, including the
+# optional fraction tail, so the fallback agrees with the marker on bare
+# fractions ("we compute 1/2 here" -> "0.5", matching "x = 1/2"). The alternation
+# in _NUM (A|B) MUST be grouped before the tail is appended — otherwise the tail
+# binds only to the second alternative and "1/0" tokenizes as ["1", "0"], letting
+# the bare denominator leak into the vote.
+_NUMBER_RE = re.compile(r"(?:" + _NUM + r")" + _FRACTION_TAIL)
+_FRACTION_RE = re.compile(r"^(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)$")
 
 
-def _strip(text: str) -> str:
-    return _THINK_RE.sub("", text).strip()
+def _normalize_float(f: float) -> str:
+    """Canonicalize a float so '42', '42.0', '4.2e1' compare equal."""
+    if f.is_integer():
+        return str(int(f))
+    return f"{f:g}"
+
+
+def _to_number(token: str) -> Optional[str]:
+    """Parse a numeric token — possibly comma-grouped or a simple a/b
+    fraction — into a normalized canonical string, or None if it isn't a clean
+    number.
+
+    Fractions are evaluated to a normalized decimal (``1/2`` -> ``0.5``) so a
+    candidate that writes a fraction votes as the SAME value as candidates that
+    write the decimal — majority voting stays coherent. A malformed or
+    zero-denominator fraction returns None (treated as non-numeric) rather than
+    silently voting the numerator and corrupting the tally.
+    """
+    token = token.strip().rstrip(".").replace(",", "")
+    if not token:
+        return None
+    frac = _FRACTION_RE.match(token)
+    if frac:
+        try:
+            den = float(frac.group(2))
+            if den == 0:
+                return None
+            return _normalize_float(float(frac.group(1)) / den)
+        except (ValueError, OverflowError):
+            return None
+    try:
+        return _normalize_float(float(token))
+    except (ValueError, OverflowError):
+        return None
 
 
 def _extract_final_answer(text: str) -> Optional[str]:
@@ -33,30 +90,24 @@ def _extract_final_answer(text: str) -> Optional[str]:
     fall back to the last number in the text (math models almost always
     end with their answer).
     """
-    text = _strip(text)
+    text = strip_thinking(text)
     if not text:
         return None
     for pat in _ANSWER_PATTERNS:
         for m in pat.finditer(text):
-            value = m.group(1).strip().replace(",", "").rstrip(".")
-            if _NUMBER_RE.fullmatch(value):
-                return _normalize(value)
-    # Fallback: last number in text
-    nums = _NUMBER_RE.findall(text)
-    if nums:
-        return _normalize(nums[-1])
+            parsed = _to_number(m.group(1))
+            if parsed is not None:
+                return parsed
+    # Fallback: scan every numeric token (comma- and fraction-aware) and return
+    # the LAST one that parses cleanly. Skipping tokens _to_number rejects (e.g.
+    # the zero-denominator "1/0") keeps the fallback honest about its own
+    # docstring contract — a malformed fraction never votes its numerator or
+    # denominator just because it sat at the end of the string.
+    for tok in reversed(_NUMBER_RE.findall(text)):
+        parsed = _to_number(tok)
+        if parsed is not None:
+            return parsed
     return None
-
-
-def _normalize(value: str) -> str:
-    """Canonicalize numeric strings so '42', '42.0', '4.2e1' compare equal."""
-    try:
-        f = float(value)
-        if f.is_integer():
-            return str(int(f))
-        return f"{f:g}"
-    except (ValueError, OverflowError):
-        return value
 
 
 class MathVerifier:

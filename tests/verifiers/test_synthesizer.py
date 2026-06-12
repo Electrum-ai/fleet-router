@@ -92,3 +92,43 @@ async def test_synthesizer_uses_heuristic_for_unregistered_tag():
     )
     # HeuristicVerifier wraps the heuristic Synthesizer's pick logic.
     assert result.winner is not None
+
+
+@pytest.mark.asyncio
+async def test_synthesizer_strips_thinking_at_candidate_boundary():
+    """Regression (BUG 1): chain-of-thought must be stripped exactly once, at
+    the candidate boundary, so Candidate.text (consumed by scoring, prompts,
+    abstention dumps, and the returned winner) is always clean. The raw
+    generation is preserved in raw_text."""
+    reg = VerifierRegistry()
+    reg.register(_FixedScoreVerifier("general", winner_idx=0, scores=[0.9]))
+    s = VerifierSynthesizer(reg)
+    result = await s.pick(
+        "p",
+        {"a": ["<thinking>secret reasoning the user must never see</thinking>final answer"]},
+        "general",
+    )
+    assert result.winner is not None
+    assert result.winner.text == "final answer"
+    assert "<thinking>" not in result.winner.text
+    assert "secret reasoning" not in result.winner.text
+    # Raw generation retained for any consumer that needs it.
+    assert "secret reasoning" in result.winner.raw_text
+
+
+@pytest.mark.asyncio
+async def test_synthesizer_drops_all_thinking_candidate():
+    """A sample that is ONLY a <think> block collapses to empty and must not
+    masquerade as a real candidate."""
+    reg = VerifierRegistry()
+    reg.register(_FixedScoreVerifier("general", winner_idx=0, scores=[0.9]))
+    s = VerifierSynthesizer(reg)
+    result = await s.pick(
+        "p",
+        {"a": ["<think>still thinking, never answered</think>"], "b": ["the real answer"]},
+        "general",
+    )
+    assert result.winner is not None
+    assert result.winner.text == "the real answer"
+    # Only one real candidate survived.
+    assert len(result.all_scored) == 1

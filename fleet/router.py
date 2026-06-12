@@ -20,6 +20,7 @@ from fleet.dispatcher import EnsembleDispatcher
 from fleet.events import EventBus, ModelDispatched, PromptClassified, ResponseSynthesized
 from fleet.registry import ModelRegistry
 from fleet.synthesizer import Synthesizer
+from fleet.text import strip_thinking
 from fleet.verifiers.base import VerificationResult
 from fleet.verifiers.code import CodeVerifier
 from fleet.verifiers.judge import JudgeVerifier
@@ -109,7 +110,15 @@ class FleetRouter:
             result = responses.get(force_model)
             if result is None:
                 return f"{ERROR_MODEL_FAILED}: {force_model}"
-            return result
+            cleaned = strip_thinking(result)
+            # A non-empty raw result that strips to "" was ALL chain-of-thought
+            # (e.g. a truncated <think> block). `cleaned or result` would leak
+            # that raw reasoning to the user — the exact bug this guards against.
+            # Surface the failure sentinel instead. A genuinely empty model
+            # response ("") is a valid answer and passes straight through.
+            if cleaned or not result:
+                return cleaned
+            return ERROR_ALL_MODELS_FAILED
 
         tag, confidence = self._classifier.classify(prompt)
         self._events.emit(PromptClassified(tag=tag, confidence=confidence, prompt=prompt))
@@ -128,7 +137,13 @@ class FleetRouter:
         responses = await self._dispatcher.run(prompt, [primary], system=system)
         result = responses.get(primary)
         if result is not None:
-            return result
+            cleaned = strip_thinking(result)
+            # All-chain-of-thought primary (non-empty raw, empty after strip):
+            # do NOT leak raw reasoning — fall to the failure sentinel. A
+            # genuinely empty "" response is a valid answer and passes through.
+            if cleaned or not result:
+                return cleaned
+            return ERROR_ALL_MODELS_FAILED
 
         fallbacks = [
             m for m in self._registry.all_available() if m != primary
@@ -137,8 +152,14 @@ class FleetRouter:
             return ERROR_ALL_MODELS_FAILED
         fb_responses = await self._dispatcher.run(prompt, fallbacks, system=system)
         for model in fallbacks:
-            if fb_responses.get(model) is not None:
-                return fb_responses[model]
+            fb = fb_responses.get(model)
+            if fb is not None:
+                cleaned = strip_thinking(fb)
+                # Skip a fallback whose entire output was chain-of-thought
+                # (would strip to "") and try the next model rather than
+                # returning raw reasoning. A genuine "" response is acceptable.
+                if cleaned or not fb:
+                    return cleaned
         return ERROR_ALL_MODELS_FAILED
 
     async def _parallel(
@@ -275,7 +296,11 @@ class FleetRouter:
             "BEST ANSWER:"
         )
         responses = await self._dispatcher.run(escalate_prompt, [model], system=system)
-        return responses.get(model)
+        escalated = responses.get(model)
+        if not escalated:
+            return None
+        # Strip the arbiter's own chain-of-thought before it reaches the user.
+        return strip_thinking(escalated) or None
 
     def _pick_arbiter(
         self, configured: str, candidates: set[str]
@@ -347,4 +372,8 @@ class FleetRouter:
         revise_resp = await self._dispatcher.run(
             revise_prompt, [critique_model], system=system
         )
-        return revise_resp.get(critique_model)
+        revised = revise_resp.get(critique_model)
+        if not revised:
+            return None
+        # Strip the critic's chain-of-thought from the revised answer.
+        return strip_thinking(revised) or None

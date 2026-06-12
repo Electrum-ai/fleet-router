@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from fleet.text import strip_thinking
 from fleet.verifiers.base import (
     DEFAULT_ABSTENTION_THRESHOLD,
     Candidate,
@@ -37,8 +38,22 @@ class VerifierSynthesizer:
         candidates: list[Candidate] = []
         for model, samples in samples_per_model.items():
             for i, text in enumerate(samples):
-                if text and text.strip():
-                    candidates.append(Candidate(model=model, sample_idx=i, text=text))
+                if not text or not text.strip():
+                    continue
+                # Strip chain-of-thought exactly ONCE, here at the candidate
+                # boundary, so scoring, judge/escalation prompts, abstention
+                # summaries, refinement input, and the returned winner are all
+                # consistently clean. Keep the original in raw_text. A sample
+                # that is *only* a <think> block collapses to "" and is
+                # dropped — it never masqueraded as a real answer.
+                cleaned = strip_thinking(text)
+                if not cleaned:
+                    continue
+                candidates.append(
+                    Candidate(
+                        model=model, sample_idx=i, text=cleaned, raw_text=text
+                    )
+                )
 
         if not candidates:
             return VerificationResult(
