@@ -88,6 +88,10 @@ class SynthesisConfig:
     judge_model: str = ""
     # Verifier-set winner.score below this triggers calibrated abstention.
     abstention_threshold: float = 0.4
+    # Swap-order consistency for the LLM judge: run the judge twice (given
+    # order + reversed) and average per-candidate scores to cancel position
+    # bias. ON by default (quality-first); OFF reverts to a single pass.
+    judge_swap_order: bool = True
     # CodeVerifier only: opt into running candidate code in a subprocess.
     # OFF by default — running LLM-generated code is a real RCE vector.
     code_execute: bool = False
@@ -349,6 +353,7 @@ def load_config(path: Path | str | None = None) -> Config:
         mode=syn_mode,
         judge_model=str(syn_raw.get("judge_model", "")),
         abstention_threshold=_coerce_float(syn_raw.get("abstention_threshold"), 0.4),
+        judge_swap_order=bool(syn_raw.get("judge_swap_order", True)),
         code_execute=bool(syn_raw.get("code_execute", False)),
         code_execute_timeout=_coerce_int(syn_raw.get("code_execute_timeout"), 5),
         code_execute_sandbox=str(syn_raw.get("code_execute_sandbox", "") or ""),

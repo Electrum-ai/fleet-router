@@ -136,6 +136,51 @@ async def test_bandit_no_update_when_no_scored_candidates():
     assert "uncertain" in result or "no answer" in result
 
 
+def test_bandit_skips_self_pref_unreliable_result():
+    """Case (a) end of FIX 1: a self-preference-biased, multi-model judge
+    result (scores_reliable=False) must NOT move any posterior — the cross-
+    model scores are biased and would poison the bandit."""
+    config = _config_with_bandit()
+    router = _ready_router(config)
+
+    biased = VerificationResult(
+        winner=Candidate("model-a", 0, "mine", score=1.0),
+        all_scored=[
+            Candidate("model-a", 0, "mine", score=1.0),
+            Candidate("model-b", 0, "theirs", score=0.0),
+        ],
+        rationale="[self-preference: ...] ",
+        scores_reliable=False,
+    )
+    router._update_bandit("math", biased)
+
+    # Untouched: both still at the uniform prior.
+    assert router._bandit.posterior_mean("math", "model-a") == 0.5
+    assert router._bandit.posterior_mean("math", "model-b") == 0.5
+
+
+def test_bandit_applies_self_consistency_reliable_result():
+    """Case (b) end of FIX 1: a single-model self-consistency judge result is
+    reliable (scores_reliable=True) and DOES update the bandit — the
+    self-pref note doesn't suppress legitimate single-pool signal."""
+    config = _config_with_bandit()
+    router = _ready_router(config)
+
+    reliable = VerificationResult(
+        winner=Candidate("model-a", 0, "s1", score=1.0),
+        all_scored=[
+            Candidate("model-a", 0, "s1", score=1.0),
+            Candidate("model-a", 1, "s2", score=1.0),
+        ],
+        rationale="[self-preference: ...] ",
+        scores_reliable=True,
+    )
+    router._update_bandit("math", reliable)
+
+    # model-a got reward=1.0 twice → posterior shifts up.
+    assert router._bandit.posterior_mean("math", "model-a") > 0.5
+
+
 @pytest.mark.asyncio
 async def test_bandit_explores_full_pool_not_just_top_n():
     """With max_parallel=2 and 3 candidate models, the bandit should be able

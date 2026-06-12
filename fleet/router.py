@@ -26,7 +26,7 @@ from fleet.text import strip_thinking
 from fleet.verifiers.base import Candidate, VerificationResult
 from fleet.verifiers.code import CodeVerifier
 from fleet.verifiers.heuristic import HeuristicVerifier
-from fleet.verifiers.judge import JudgeVerifier
+from fleet.verifiers.judge import JudgeVerifier, _candidate_label
 from fleet.verifiers.math import MathVerifier
 from fleet.verifiers.registry import VerifierRegistry
 from fleet.verifiers.synthesizer import VerifierSynthesizer
@@ -130,7 +130,10 @@ class FleetRouter:
 
         judge_key = self._config.synthesis.judge_model
         if judge_key:
-            judges = [self._make_judge(judge_key, tag) for tag in _JUDGE_TAGS]
+            judges = [
+                self._make_judge(judge_key, tag, with_neutral=True)
+                for tag in _JUDGE_TAGS
+            ]
             if all(j is not None for j in judges):
                 for j in judges:
                     registry.register(j)
@@ -145,18 +148,73 @@ class FleetRouter:
             abstention_threshold=self._config.synthesis.abstention_threshold,
         )
 
-    def _make_judge(self, model_key: str, tag: str) -> Optional[JudgeVerifier]:
+    def _make_judge(
+        self,
+        model_key: str,
+        tag: str,
+        *,
+        with_neutral: bool = False,
+        swap_order: Optional[bool] = None,
+    ) -> Optional[JudgeVerifier]:
         """Construct a JudgeVerifier bound to `model_key` for `tag`, or None
         when that model's provider isn't in the pool. Shared by the registry
         build and by the neutral-judge swap that defeats verify-step
-        self-preference (a judge grading its own escalated/refined answer)."""
+        self-preference (a judge grading its own escalated/refined answer).
+
+        `with_neutral=True` (PRIMARY scoring path only) wires a
+        `neutral_factory` so that, at scoring time, a judge whose own model is
+        among the candidates delegates to a neutral judge bound to a
+        non-candidate model. The neutral judge is built with
+        `with_neutral=False`, which guarantees termination: it carries no
+        factory, and `_pick_arbiter` only ever returns a model that is NOT a
+        candidate, so it could never re-trigger the self-preference swap.
+
+        `swap_order` (position-bias de-biasing) defaults to config ONLY on the
+        primary path (`with_neutral=True`); verify-step callers
+        (`_score_neutral`) get a single pass, leaving the Stage-2 verify
+        behavior untouched. The neutral judge composes swap-order: it is built
+        with the same `swap_order` as the judge it stands in for."""
         entry = self._config.models.get(model_key)
         provider_name = entry.provider if entry else "ollama"
         api_model = entry.api_model if entry and entry.api_model else model_key
         provider = self._dispatcher._pool.get(provider_name)
         if provider is None:
             return None
-        return JudgeVerifier(provider, api_model, tag=tag)
+
+        if swap_order is None:
+            swap_order = (
+                self._config.synthesis.judge_swap_order if with_neutral else False
+            )
+
+        neutral_factory = None
+        if with_neutral:
+
+            def neutral_factory(
+                candidate_models: set[str],
+                judge_key: str = model_key,
+                judge_tag: str = tag,
+                swap: bool = swap_order,
+            ) -> Optional[JudgeVerifier]:
+                # Reuse the production self-preference guard: pick an available
+                # model that is NOT a candidate. Returns the configured key when
+                # the judge isn't a candidate (no swap) and None when no neutral
+                # model exists — both mean "don't swap".
+                alt = self._pick_arbiter(judge_key, candidate_models)
+                if alt is None or alt == judge_key:
+                    return None
+                # The neutral judge composes swap-order but carries NO factory
+                # (with_neutral defaults False) → recursion cannot occur, since
+                # _pick_arbiter only ever returns a non-candidate model.
+                return self._make_judge(alt, judge_tag, swap_order=swap)
+
+        return JudgeVerifier(
+            provider,
+            api_model,
+            tag=tag,
+            model_key=model_key,
+            neutral_factory=neutral_factory,
+            swap_order=swap_order,
+        )
 
     def refresh(self) -> None:
         """Eagerly refresh the model registry."""
@@ -375,7 +433,7 @@ class FleetRouter:
         # Show the top 3 candidates by score for arbitration.
         top = sorted(result.all_scored, key=lambda c: -c.score)[:3]
         candidates_block = "\n\n".join(
-            f"--- Candidate {chr(65+i)} (model={c.model}, score={c.score:.2f}) ---\n{c.text}"
+            f"--- Candidate {_candidate_label(i)} (model={c.model}, score={c.score:.2f}) ---\n{c.text}"
             for i, c in enumerate(top)
         )
         escalate_prompt = (

@@ -735,3 +735,54 @@ async def test_thinking_stripped_from_force_model_path():
         result = await router.ask("hello", force_model="forced")
     assert result == "just the answer"
     assert "<think>" not in result
+
+
+# ---------- PRIMARY-path neutral judge (self-preference, end-to-end) ----------
+
+
+@pytest.mark.asyncio
+async def test_primary_path_uses_neutral_judge_when_judge_is_candidate():
+    """End-to-end (_parallel → pick → JudgeVerifier.aggregate): the configured
+    judge "J" is also a candidate, so the registry judge must delegate scoring
+    to a NEUTRAL judge bound to "K" (the only available non-candidate). We patch
+    run_multi (so the only provider.generate calls are JUDGE calls) and assert
+    the judge request was issued for model "K", never "J"."""
+    from fleet.config import SynthesisConfig as _Syn
+    from fleet.providers.pool import ProviderPool
+
+    judge_models_seen: list[str] = []
+
+    async def capture_generate(req):
+        judge_models_seen.append(req.model)
+        # Score candidate A (model J) highest so the winner is deterministic.
+        return ['{"scores": {"A": 9, "B": 2}, "best": "A"}']
+
+    stub = AsyncMock()
+    stub.name = "ollama"
+    stub.generate = AsyncMock(side_effect=capture_generate)
+
+    config = Config(
+        models={
+            "J": ModelEntry(tags=["reasoning"], priority=1),
+            "N": ModelEntry(tags=["reasoning"], priority=2),
+        },
+        synthesis=_Syn(mode="verifier", judge_model="J", judge_swap_order=False),
+    )
+    pool = ProviderPool({"ollama": stub})
+    with patch("fleet.dispatcher.ProviderPool.from_config", return_value=pool):
+        router = FleetRouter(config)
+    # J and N are candidates; K is an available, non-candidate neutral model.
+    router._registry._available = {"J", "N", "K"}
+    router._registry._refreshed = True
+
+    with patch.object(router._classifier, "classify", return_value=("reasoning", 0.0)), \
+         patch.object(router._dispatcher, "run_multi", new_callable=AsyncMock) as run_multi:
+        run_multi.return_value = {"J": ["answer from J"], "N": ["answer from N"]}
+        result = await router.ask("think hard about this")
+
+    # The neutral judge (model K) graded; the self-preferring judge J never did.
+    assert judge_models_seen, "judge was never invoked"
+    assert set(judge_models_seen) == {"K"}
+    assert "J" not in judge_models_seen
+    # Winner maps back to candidate A = model J's answer.
+    assert result == "answer from J"
