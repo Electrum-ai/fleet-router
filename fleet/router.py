@@ -65,6 +65,7 @@ class FleetRouter:
         registry.register(CodeVerifier(
             execute=self._config.synthesis.code_execute,
             execute_timeout=self._config.synthesis.code_execute_timeout,
+            sandbox=self._config.synthesis.code_execute_sandbox,
         ))
         registry.register(MathVerifier())
 

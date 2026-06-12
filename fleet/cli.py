@@ -160,9 +160,34 @@ def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
     return 0
 
 
+# Hosts that only ever accept connections from the same machine. Binding to
+# any of these without an API key is the single-user default and stays
+# allowed; binding to anything else (0.0.0.0, a LAN IP, a public hostname)
+# without a key would expose the operator's Ollama compute as an open relay.
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+
+
 def _run_serve(router: FleetRouter, args: argparse.Namespace) -> int:
     # Lazy import — proxy module pulls in aiohttp.web, only needed here.
     from fleet.proxy import serve
+
+    # Refuse to bind a non-loopback interface without authentication. Without
+    # this guard, `fleet --serve --host 0.0.0.0` is an unauthenticated relay to
+    # the operator's Ollama compute for anyone on the network.
+    host = (args.host or "").strip()
+    if host.lower() not in _LOOPBACK_HOSTS and not args.api_key:
+        print(
+            f"fleet: refusing to bind non-loopback host {args.host!r} without "
+            "an API key.\n"
+            "       This would expose your Ollama backend as an open relay.\n"
+            "       Pass --api-key to require authentication, e.g.:\n"
+            "         fleet --serve --host "
+            f"{args.host} --api-key \"$(openssl rand -hex 32)\"\n"
+            "       Or bind a loopback host (127.0.0.1 / localhost) for "
+            "single-user local use.",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         serve(router, host=args.host, port=args.port, api_key=args.api_key)

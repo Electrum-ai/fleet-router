@@ -1,9 +1,17 @@
 """Code verifier — AST validation + (optional) sandboxed execution.
 
-Execution is OPT-IN because running arbitrary LLM-generated code is a real
-RCE vector. Even with `execute=True`, we statically reject obvious dangerous
-patterns (subprocess, os.system, network, file I/O) before running. This is
-NOT a sandbox — for production use, wrap in firejail/bubblewrap/Docker.
+Execution is HARD-GATED behind an operator-supplied sandbox. Candidate code
+runs ONLY when BOTH `execute=True` AND a non-empty `sandbox` command template
+is configured; in that case the code runs THROUGH that template (the project
+never runs raw, unsandboxed code). If `execute=True` but no sandbox is set,
+execution is DISABLED and the verifier falls back to AST-only static scoring,
+emitting a one-time warning at construction.
+
+The AST denylist (_DANGEROUS_IMPORTS/_DANGEROUS_CALLS) is an ADVISORY
+pre-filter, NOT a security boundary: it is trivially bypassable (e.g.
+``getattr(__builtins__, ...)``, ``().__class__.__subclasses__()``), so it
+must never be relied on to make untrusted code safe to run. The sandbox
+command (firejail/bubblewrap/Docker/etc.) is the only real boundary.
 """
 from __future__ import annotations
 
@@ -12,6 +20,8 @@ import asyncio
 import logging
 import os
 import re
+import shlex
+import shutil
 import sys
 import tempfile
 
@@ -66,9 +76,29 @@ class CodeVerifier:
 
     tag = "code"
 
-    def __init__(self, execute: bool = False, execute_timeout: int = 5):
+    def __init__(
+        self,
+        execute: bool = False,
+        execute_timeout: int = 5,
+        sandbox: str = "",
+    ):
         self._execute = execute
         self._timeout = execute_timeout
+        self._sandbox = (sandbox or "").strip()
+        # Execution is gated on BOTH the opt-in AND a configured sandbox.
+        self._will_execute = bool(execute and self._sandbox)
+        if execute and not self._sandbox:
+            logger.warning(
+                "CodeVerifier: code_execute is ENABLED but no "
+                "code_execute_sandbox is configured. The AST denylist is an "
+                "ADVISORY pre-filter, NOT a security boundary — it is trivially "
+                "bypassable (e.g. getattr(__builtins__, ...), "
+                "().__class__.__subclasses__()). Code execution is therefore "
+                "DISABLED; falling back to AST-only static scoring. Set "
+                "synthesis.code_execute_sandbox to a sandbox command template "
+                "(e.g. 'firejail --net=none --private={dir} {python} {file}') "
+                "to run candidate code."
+            )
 
     async def aggregate(
         self,
@@ -106,6 +136,9 @@ class CodeVerifier:
         except (RecursionError, MemoryError):
             return candidate.with_score(0.0, "parse exhausted resources")
 
+        # Advisory pre-filter only — NOT a security boundary (see module
+        # docstring). Rejects obviously-dangerous code before it would even
+        # reach the sandbox, but the sandbox is what actually contains risk.
         dangerous, why = _has_dangerous_pattern(tree)
         if dangerous:
             return candidate.with_score(0.5, f"parses; unsafe ({why}); not executing")
@@ -117,11 +150,14 @@ class CodeVerifier:
         # triggered escalation. Spreading multiple weak signals across
         # 0.50–0.85 lets candidates differentiate while keeping room for
         # an "executes cleanly" candidate to win at 1.0 when execute=True.
-        if not self._execute:
+        # AST-only scoring whenever execution is not actually enabled — either
+        # execute=False, or execute=True with no configured sandbox (in which
+        # case we DO NOT run the code; see the constructor warning).
+        if not self._will_execute:
             score, notes = self._distributed_static_score(tree, code)
             return candidate.with_score(score, notes)
 
-        # Execution gate — runs in a subprocess with timeout.
+        # Execution gate — runs THROUGH the operator's sandbox with a timeout.
         exec_score, exec_note = await self._try_execute(code)
         # When execution is on, parse-only signals are noise; trust the
         # execution outcome.
@@ -175,16 +211,36 @@ class CodeVerifier:
         score = min(score, 0.85)
         return score, "; ".join(["parses", *signals])
 
+    def _build_sandbox_argv(self, file_path: str, workdir: str) -> list[str]:
+        """Render the operator's sandbox command template into an argv list,
+        substituting {python}/{file}/{dir}. Tokenized via shlex BEFORE
+        substitution so a path containing spaces can't reshape the command."""
+        subs = {
+            "{python}": sys.executable,
+            "{file}": file_path,
+            "{dir}": workdir,
+        }
+        argv: list[str] = []
+        for tok in shlex.split(self._sandbox):
+            for placeholder, value in subs.items():
+                tok = tok.replace(placeholder, value)
+            argv.append(tok)
+        return argv
+
     async def _try_execute(self, code: str) -> tuple[float, str]:
-        path: str = ""
+        # Write the candidate into a private temp dir so the sandbox template
+        # has a {dir} to confine to. Execution always goes THROUGH the
+        # operator's sandbox command — never a raw interpreter.
+        workdir = tempfile.mkdtemp(prefix="fleet-code-")
+        path = os.path.join(workdir, "candidate.py")
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".py", delete=False
-            ) as f:
+            with open(path, "w") as f:
                 f.write(code)
-                path = f.name
+            argv = self._build_sandbox_argv(path, workdir)
+            if not argv:
+                return 0.5, "exec scaffolding failed: empty sandbox command"
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-I", path,
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -197,15 +253,11 @@ class CodeVerifier:
                 await proc.wait()
                 return 0.5, "execution timed out"
             if proc.returncode == 0:
-                return 1.0, "executes cleanly"
+                return 1.0, "executes cleanly (sandboxed)"
             err = stderr.decode("utf-8", errors="replace")[:200]
             return 0.6, f"runtime error: {err}"
         except Exception as exc:  # noqa: BLE001
             logger.warning("code exec scaffolding failed: %s", exc)
             return 0.5, f"exec scaffolding failed: {type(exc).__name__}"
         finally:
-            if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+            shutil.rmtree(workdir, ignore_errors=True)

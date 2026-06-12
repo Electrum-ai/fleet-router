@@ -51,6 +51,91 @@ from fleet.router import (
 
 logger = logging.getLogger(__name__)
 
+
+def _coerce_int(raw: Any, default: int) -> int:
+    """Defensive int coercion mirroring fleet.config._coerce_int. A client
+    sending `max_tokens: "abc"` must fall back to the default rather than
+    blow up with a ValueError surfaced as an opaque 500."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _client_safe_error(exc: Exception, where: str) -> str:
+    """Log the full exception server-side under a short correlation id and
+    return a GENERIC client-facing message carrying only that id. Internal
+    detail (file paths, model ids, backend URLs, stack traces) must never
+    reach the client; operators correlate the client-visible id with the
+    server log to triage. Must be called from within an `except` block so
+    `logger.exception` captures the active traceback."""
+    corr_id = uuid.uuid4().hex[:8]
+    logger.exception("router.ask failed [id=%s] (%s)", corr_id, where)
+    return f"(router error [id={corr_id}] - see server logs)"
+
+
+# Hostnames that are inherently same-machine. A Host header naming one of
+# these can only originate from a client already targeting localhost, so it
+# is exempt from the port-exact allowlist (this also lets the aiohttp test
+# server's ephemeral port and the boot poller through). A DNS-rebinding
+# attacker's page sends Host: evil.com:PORT, whose hostname is foreign and is
+# therefore rejected — which is the whole point of Host validation.
+_LOOPBACK_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_only(host_header: str) -> str:
+    """Extract the hostname from a Host header, dropping the port. Handles
+    bracketed IPv6 (`[::1]:8765` → `::1`), `host:port`, bare hostnames, and
+    bare unbracketed IPv6 (`::1`)."""
+    h = host_header.strip()
+    if h.startswith("["):
+        end = h.find("]")
+        if end != -1:
+            return h[1:end].lower()
+        return h.lower()
+    if h.count(":") == 1:  # host:port (a bare IPv6 has 2+ colons)
+        return h.rsplit(":", 1)[0].lower()
+    return h.lower()
+
+
+def _default_allowed_hosts(host: str, port: int) -> set[str]:
+    """Loopback host:port forms the proxy answers to by default, plus the
+    operator's actual bind host:port so binding a real interface works."""
+    allowed = {
+        f"127.0.0.1:{port}",
+        f"localhost:{port}",
+        f"[::1]:{port}",
+    }
+    h = (host or "").strip()
+    if h and h not in {"0.0.0.0", "::"}:  # wildcard binds can't be enumerated
+        if ":" in h and not h.startswith("["):
+            allowed.add(f"[{h}]:{port}")  # bare IPv6 → bracketed Host form
+        else:
+            allowed.add(f"{h}:{port}")
+    return allowed
+
+
+def _make_host_guard(allowed_hosts: set[str]):
+    """Build an aiohttp middleware that rejects requests whose Host header is
+    neither in `allowed_hosts` nor a loopback hostname. Defends against
+    DNS-rebinding / CSRF where a browser page resolves a foreign name to
+    127.0.0.1 and drives the proxy from the victim's session."""
+
+    @web.middleware
+    async def _host_guard(request: web.Request, handler: Any) -> web.StreamResponse:
+        host_header = request.headers.get("Host")
+        if not host_header:
+            raise web.HTTPMisdirectedRequest(reason="missing Host header")
+        if host_header in allowed_hosts:
+            return await handler(request)
+        if _host_only(host_header) in _LOOPBACK_HOSTNAMES:
+            return await handler(request)
+        logger.warning("rejected request with foreign Host header: %r", host_header)
+        raise web.HTTPMisdirectedRequest(reason="Host not allowed")
+
+    return _host_guard
+
+
 # Sentinel responses from router.ask that indicate Ollama is unreachable or
 # misconfigured. router.ask never raises for these — it returns the string
 # directly — so the proxy has to pattern-match to attach an actionable hint.
@@ -217,7 +302,7 @@ def _parse_request(body: dict) -> _ParsedRequest:
         system=system,
         stream=bool(body.get("stream", False)),
         requested_model=str(body.get("model", "fleet-router")),
-        max_tokens=int(body.get("max_tokens", 4096)),
+        max_tokens=_coerce_int(body.get("max_tokens", 4096), 4096),
     )
 
 
@@ -271,7 +356,11 @@ def _parse_openai_chat_request(body: dict) -> _ParsedRequest:
         system="\n\n".join(system_parts) if system_parts else None,
         stream=bool(body.get("stream", False)),
         requested_model=str(body.get("model", "fleet-router")),
-        max_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or 4096),
+        max_tokens=_coerce_int(
+            body.get("max_tokens") if body.get("max_tokens") is not None
+            else body.get("max_completion_tokens"),
+            4096,
+        ),
     )
 
 
@@ -436,13 +525,22 @@ def build_app(
     *,
     api_key: Optional[str] = None,
     prompt_deadline_s: float = _DEFAULT_PROMPT_DEADLINE_S,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    allowed_hosts: Optional[set[str]] = None,
 ) -> web.Application:
     """Construct the aiohttp app. `api_key`, if set, is required as the
     `x-api-key` header — basic guard against a stray local request hitting
     your fleet from elsewhere on the network. `prompt_deadline_s` caps
     how long a single /v1/messages request will wait for router.ask
-    before giving up and returning a structured error."""
-    app = web.Application()
+    before giving up and returning a structured error.
+
+    `host`/`port` seed the Host-header allowlist (DNS-rebinding / CSRF
+    defense): requests whose Host header is neither a loopback hostname nor
+    in the allowlist get 421. An operator binding a real hostname can extend
+    the allowlist via `allowed_hosts` (e.g. {"fleet.internal:8765"})."""
+    allowed = allowed_hosts if allowed_hosts is not None else _default_allowed_hosts(host, port)
+    app = web.Application(middlewares=[_make_host_guard(allowed)])
 
     async def healthz(_request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "service": "fleet-proxy"})
@@ -477,6 +575,8 @@ def build_app(
             body = await request.json()
         except json.JSONDecodeError as exc:
             raise web.HTTPBadRequest(reason=f"invalid JSON: {exc}")
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(reason="request body must be a JSON object")
 
         parsed = _parse_request(body)
         prompt_tokens = _approx_tokens(parsed.prompt)
@@ -500,9 +600,8 @@ def build_app(
                     reason=f"router.ask exceeded {prompt_deadline_s}s deadline"
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("router.ask failed")
                 raise web.HTTPInternalServerError(
-                    reason=f"router error: {type(exc).__name__}: {exc}"
+                    reason=_client_safe_error(exc, "messages non-stream")
                 )
             if isinstance(answer, dict):
                 answer = "\n\n".join(f"--- {m} ---\n{t}" for m, t in answer.items())
@@ -556,13 +655,21 @@ def build_app(
                         # finished — pull its result on the next loop iter.
                         continue
                     await resp.write(_ping_event())
+        except asyncio.TimeoutError as exc:
+            # Deadline expiry — the message is just a duration, no internal
+            # detail, so surface it verbatim so the user sees *why* it stopped.
+            err_text = f"(router error: {exc})"
+            async for chunk in _stream_anthropic_body(err_text):
+                await resp.write(chunk)
+            await resp.write_eof()
+            return resp
         except Exception as exc:  # noqa: BLE001
-            logger.exception("router.ask failed mid-stream")
             # Surface the failure as a text block + clean stream close.
             # We can't switch to HTTP 500 once headers are out — the SDK
             # would see a half-stream and treat it as a network error,
-            # which is worse than a structured error message.
-            err_text = f"(router error: {type(exc).__name__}: {exc})"
+            # which is worse than a structured error message. The message is
+            # generic; full detail is logged server-side under the same id.
+            err_text = _client_safe_error(exc, "messages mid-stream")
             async for chunk in _stream_anthropic_body(err_text):
                 await resp.write(chunk)
             await resp.write_eof()
@@ -593,6 +700,8 @@ def build_app(
             body = await request.json()
         except json.JSONDecodeError as exc:
             raise web.HTTPBadRequest(reason=f"invalid JSON: {exc}")
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(reason="request body must be a JSON object")
 
         parsed = _parse_openai_chat_request(body)
         prompt_tokens = _approx_tokens(parsed.prompt)
@@ -615,9 +724,8 @@ def build_app(
                     reason=f"router.ask exceeded {prompt_deadline_s}s deadline"
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("router.ask failed (openai endpoint)")
                 raise web.HTTPInternalServerError(
-                    reason=f"router error: {type(exc).__name__}: {exc}"
+                    reason=_client_safe_error(exc, "chat_completions non-stream")
                 )
             answer = _maybe_enrich_with_ollama_hint(_coerce_answer_to_string(answer))
             return web.json_response(_build_chat_completion_response(
@@ -664,9 +772,22 @@ def build_app(
                     if ask_task.done():
                         continue
                     await resp.write(_openai_heartbeat())
+        except asyncio.TimeoutError as exc:
+            # Deadline expiry — non-sensitive duration message, surfaced as-is.
+            err_text = f"(router error: {exc})"
+            for i in range(0, len(err_text), _STREAM_CHUNK_CHARS):
+                await resp.write(_openai_chunk(
+                    completion_id, parsed.requested_model,
+                    {"content": err_text[i:i + _STREAM_CHUNK_CHARS]},
+                ))
+            await resp.write(_openai_chunk(
+                completion_id, parsed.requested_model, {}, finish="stop",
+            ))
+            await resp.write(_openai_done())
+            await resp.write_eof()
+            return resp
         except Exception as exc:  # noqa: BLE001
-            logger.exception("router.ask failed mid-stream (openai)")
-            err_text = f"(router error: {type(exc).__name__}: {exc})"
+            err_text = _client_safe_error(exc, "chat_completions mid-stream")
             # Reuse the streaming body — emit the error as content so
             # clients see structured failure text, then [DONE].
             for i in range(0, len(err_text), _STREAM_CHUNK_CHARS):
@@ -709,9 +830,19 @@ def serve(
     port: int = 8765,
     api_key: Optional[str] = None,
     prompt_deadline_s: float = _DEFAULT_PROMPT_DEADLINE_S,
+    allowed_hosts: Optional[set[str]] = None,
 ) -> None:
-    """Blocking serve — used by the CLI."""
-    app = build_app(router, api_key=api_key, prompt_deadline_s=prompt_deadline_s)
+    """Blocking serve — used by the CLI. `allowed_hosts`, if given, extends
+    the default Host-header allowlist (which already covers loopback and the
+    bind host:port) for operators fronting the proxy with a real hostname."""
+    app = build_app(
+        router,
+        api_key=api_key,
+        prompt_deadline_s=prompt_deadline_s,
+        host=host,
+        port=port,
+        allowed_hosts=allowed_hosts,
+    )
     logger.info(
         "fleet-proxy listening on http://%s:%d (deadline=%.0fs)",
         host, port, prompt_deadline_s,

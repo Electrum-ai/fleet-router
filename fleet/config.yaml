@@ -40,10 +40,16 @@ synthesis:
   # Strongest model arbitrates judge-based tags (reasoning, creative, …).
   judge_model: deepseek-v4-pro
   abstention_threshold: 0.4
-  # OFF for security: running LLM-generated code is a real RCE vector
-  # even with static safety checks. Opt in only if you trust the sandbox.
+  # OFF for security: running LLM-generated code is a real RCE vector.
   code_execute: false
   code_execute_timeout: 5
+  # Sandbox command TEMPLATE. Execution happens ONLY when code_execute is true
+  # AND this is non-empty; code then runs THROUGH this command, never raw.
+  # {python}/{file}/{dir} are substituted at run time. Empty (default) means
+  # code is NEVER executed (AST-only scoring). The AST denylist is an advisory
+  # pre-filter, NOT a sandbox boundary.
+  # Example: "firejail --net=none --private={dir} {python} {file}"
+  code_execute_sandbox: ""
 
 sampling:
   samples_by_tag:

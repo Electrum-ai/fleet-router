@@ -84,7 +84,7 @@ The trade: **per-prompt latency goes 10–30× and cost goes 20–80×, in excha
 
 ### Quality by default
 
-Out of the box, every quality lever is **ON**: parallel ensemble, multi-sample self-consistency, verifier-driven scoring, LLM-as-judge, calibrated abstention, disagreement escalation, critique-and-revise refinement, and bandit learning. The only quality lever that ships **OFF** is `code_execute` — running LLM-generated code is a real RCE vector even with static safety checks, so opting in is a deliberate choice.
+Out of the box, every quality lever is **ON**: parallel ensemble, multi-sample self-consistency, verifier-driven scoring, LLM-as-judge, calibrated abstention, disagreement escalation, critique-and-revise refinement, and bandit learning. The only quality lever that ships **OFF** is `code_execute` — running LLM-generated code is a real RCE vector. Even when you opt in, execution is **hard-gated**: code runs only when you also supply a `code_execute_sandbox` command (firejail/bubblewrap/Docker/etc.) for it to run through. With `code_execute: true` but no sandbox, the verifier logs a warning and falls back to AST-only static scoring — it never runs the code. The AST denylist is an **advisory pre-filter, not a security boundary** (it is trivially bypassable), so the sandbox is the only real isolation.
 
 To downshift (faster, cheaper, lower quality), opt out explicitly in `~/.fleet/config.yaml`. See [Configuration](#configuration).
 
@@ -141,7 +141,7 @@ flowchart LR
 
 | Tag | Verifier | Quality Signal |
 |---|---|---|
-| `code` | `CodeVerifier` | AST validity + (opt-in) sandboxed execution |
+| `code` | `CodeVerifier` | AST validity + (opt-in) execution, hard-gated behind a sandbox |
 | `math` | `MathVerifier` | Numeric extraction + cross-sample majority vote |
 | `reasoning`, `creative`, `summarize`, `translate`, `general` | `JudgeVerifier` | LLM-as-judge with tag-specific rubric |
 | any (fallback) | `HeuristicVerifier` | Length / AST / diversity (legacy synthesizer) |
@@ -151,7 +151,7 @@ flowchart LR
 ## Features
 
 ### 🔬 Verifier-driven synthesis
-No more "longest" or "lexically diverse" winning. Each tag has an executable or judge-based scorer. Code is AST-validated (and optionally sandbox-executed). Math runs majority vote over numeric answers. Reasoning/creative/etc. go to an LLM judge with a tag-specific rubric.
+No more "longest" or "lexically diverse" winning. Each tag has an executable or judge-based scorer. Code is AST-validated (and optionally executed, but only through an operator-configured sandbox — see `code_execute_sandbox`). Math runs majority vote over numeric answers. Reasoning/creative/etc. go to an LLM judge with a tag-specific rubric.
 
 ### 🎯 Self-consistency sampling
 Math and reasoning tags sample the same model N times (default 5 / 3) and majority-vote. On GSM8K-class problems this closes most of the gap to frontier models with the same base LLM.
@@ -352,8 +352,13 @@ synthesis:
   mode: verifier
   judge_model: deepseek-v4-pro  # strongest model arbitrates judge-based tags
   abstention_threshold: 0.4
-  code_execute: false           # OFF for security — opt in only if you trust the sandbox
+  code_execute: false           # OFF for security — running LLM code is an RCE vector
   code_execute_timeout: 5
+  # Sandbox command TEMPLATE. Execution happens ONLY when code_execute is true
+  # AND this is non-empty; code then runs THROUGH this command (never raw).
+  # {python}/{file}/{dir} are substituted at run time. Empty → never executes
+  # (AST-only scoring). The AST denylist is advisory, NOT a sandbox boundary.
+  code_execute_sandbox: ""      # e.g. "firejail --net=none --private={dir} {python} {file}"
 
 sampling:
   samples_by_tag:
@@ -458,7 +463,7 @@ Keyword regex with **saturating exponential** scoring (1 match → 0.55, 2 → 0
 
 ### Verification
 
-Per-tag verifiers replace heuristics. `CodeVerifier` AST-walks for dangerous patterns (subprocess, eval, file I/O, network) and **refuses to execute** unsafe code even with `code_execute=true`. `MathVerifier` extracts final numeric answers (handling `\boxed{}`, "answer is X", scientific notation, decimals) and majority-votes. `JudgeVerifier` sends labeled candidates to an Ollama judge with a tag-specific rubric and parses ranked output (with JSON-extraction fallback for verbose models).
+Per-tag verifiers replace heuristics. `CodeVerifier` AST-walks for dangerous patterns (subprocess, eval, file I/O, network) as an **advisory pre-filter** and refuses to even hand obviously-dangerous code to the sandbox. This denylist is **not** a security boundary (it is trivially bypassable via `getattr`/`__subclasses__`), so execution is hard-gated: candidate code runs only when `code_execute=true` **and** a `code_execute_sandbox` command template is configured, and then only *through* that sandbox. With no sandbox, the verifier warns and scores by AST alone. `MathVerifier` extracts final numeric answers (handling `\boxed{}`, "answer is X", scientific notation, decimals) and majority-votes. `JudgeVerifier` sends labeled candidates to an Ollama judge with a tag-specific rubric and parses ranked output (with JSON-extraction fallback for verbose models).
 
 ### Calibrated Abstention
 

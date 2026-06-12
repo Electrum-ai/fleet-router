@@ -8,13 +8,16 @@ When Claude Code starts a session in this directory, the SessionStart hook
 at `.claude/settings.json` runs `scripts/fleet-ensure-proxy.py`. That
 script:
 
-- Checks `${TMPDIR:-/tmp}/fleet-proxy.pid` and `http://127.0.0.1:8765/healthz`
+- Checks `~/.fleet/run/fleet-proxy.pid` and `http://127.0.0.1:8765/healthz`
 - Starts `venv/bin/fleet --serve --port 8765 --api-key fleet-local` if not up
 - Coordinates concurrent SessionStart fires via flock on
-  `${TMPDIR:-/tmp}/fleet-ensure-proxy.lock`
+  `~/.fleet/run/fleet-ensure-proxy.lock`
 - Polls `/healthz` for up to 60s (cold start loads sentence-transformers)
 
-Logs land in `${TMPDIR:-/tmp}/fleet-proxy.log`.
+Runtime state lives in a private `~/.fleet/run/` directory (created mode
+0700) — not world-writable `$TMPDIR`/`/tmp`, where a predictable path
+allowed symlink and pid-confusion attacks. Logs land in
+`~/.fleet/run/fleet-proxy.log`.
 
 The hook only ensures the proxy is running. It does **not** redirect this
 Claude Code session through the proxy — see "Tool-loop limitation" below
@@ -101,7 +104,7 @@ windows still use Anthropic.
 
 - **Hook never ran**: check `~/.claude/settings.json` doesn't override the
   project hook. Settings merge — project additions, user overrides.
-- **Proxy didn't come up**: read `${TMPDIR:-/tmp}/fleet-proxy.log` and run
+- **Proxy didn't come up**: read `~/.fleet/run/fleet-proxy.log` and run
   `python3 scripts/fleet-ensure-proxy.py` manually to see stderr.
 - **`(all models failed)` in chat replies**: Ollama isn't reachable. The
   proxy now appends a hint with `ollama serve` and `curl
@@ -115,7 +118,7 @@ windows still use Anthropic.
 
 - Disable the slash command: `rm ~/.claude/skills/fleet/SKILL.md`
 - Disable the auto-start: `rm /Users/bistrocloud/fleet-router/.claude/settings.json`
-- Stop the proxy: `kill $(cat ${TMPDIR:-/tmp}/fleet-proxy.pid)` or
+- Stop the proxy: `kill $(cat ~/.fleet/run/fleet-proxy.pid)` or
   `fleet-off` if the toggle is sourced.
 
 ## File map for this integration

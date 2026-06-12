@@ -246,3 +246,37 @@ bandit:
     assert cfg.refinement.enabled is False
     assert cfg.escalation.enabled is False
     assert cfg.bandit.enabled is False
+
+
+def test_synthesis_code_execute_sandbox_default_empty():
+    """C1: a config with no synthesis block defaults the sandbox to empty —
+    which (combined with code_execute defaulting False) means code never runs."""
+    cfg = Config()
+    assert cfg.synthesis.code_execute is False
+    assert cfg.synthesis.code_execute_sandbox == ""
+
+
+def test_synthesis_code_execute_sandbox_parsed(tmp_path):
+    yaml_text = """
+synthesis:
+  code_execute: true
+  code_execute_sandbox: "firejail --net=none --private={dir} {python} {file}"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.synthesis.code_execute is True
+    assert cfg.synthesis.code_execute_sandbox == \
+        "firejail --net=none --private={dir} {python} {file}"
+
+
+def test_synthesis_code_execute_sandbox_coerces_non_string(tmp_path):
+    yaml_text = """
+synthesis:
+  code_execute_sandbox: 12345
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    # Non-string coerces to its str form (or empty), never crashes.
+    assert isinstance(cfg.synthesis.code_execute_sandbox, str)

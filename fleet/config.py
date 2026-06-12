@@ -92,6 +92,13 @@ class SynthesisConfig:
     # OFF by default — running LLM-generated code is a real RCE vector.
     code_execute: bool = False
     code_execute_timeout: int = 5
+    # Operator-supplied sandbox command TEMPLATE used to run candidate code.
+    # Execution happens ONLY when code_execute is True AND this is non-empty.
+    # Placeholders {python}/{file}/{dir} are substituted at run time, e.g.
+    # "firejail --net=none --private={dir} {python} {file}". Empty (default)
+    # means code is NEVER executed — the AST denylist is an advisory filter,
+    # not a sandbox, so CodeVerifier falls back to AST-only static scoring.
+    code_execute_sandbox: str = ""
 
 
 @dataclass
@@ -344,6 +351,7 @@ def load_config(path: Path | str | None = None) -> Config:
         abstention_threshold=_coerce_float(syn_raw.get("abstention_threshold"), 0.4),
         code_execute=bool(syn_raw.get("code_execute", False)),
         code_execute_timeout=_coerce_int(syn_raw.get("code_execute_timeout"), 5),
+        code_execute_sandbox=str(syn_raw.get("code_execute_sandbox", "") or ""),
     )
 
     samp_raw = raw.get("sampling", {}) if isinstance(raw.get("sampling"), dict) else {}
