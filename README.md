@@ -13,7 +13,7 @@
 *Quality-first. Not fastest. Not cheapest. **Best answer.***
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-256%20passing-2ea44f)](#testing)
+[![Tests](https://img.shields.io/badge/tests-362%20passing-2ea44f)](#testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Runtime: Ollama](https://img.shields.io/badge/runtime-Ollama-FF6B35?logo=ollama&logoColor=white)](https://ollama.com)
 [![Quality: Max by default](https://img.shields.io/badge/quality-max%20by%20default-blueviolet)](#quality-by-default)
@@ -513,14 +513,14 @@ Built-in scorers:
 ## Testing
 
 ```bash
-pytest tests/                # 256 passing
+pytest tests/                # 362 passing (1 skips without sentence-transformers)
 pytest tests/verifiers/      # verifier framework
 pytest tests/evals/          # harness + scorers
 pytest tests/test_proxy.py   # Anthropic + OpenAI proxy compatibility
 pytest tests/test_cli.py     # CLI: ask / eval / serve / quiet
 ```
 
-256 tests across 28 files cover providers (including session reuse + concurrency-cap regression guards), verifiers (code/math/judge/heuristic), self-consistency, escalation, refinement, abstention (including self-judge bias guards), bandit (selection + posterior updates + persistence), event bus + progress sink, LLM classifier, retrieval, eval harness + comparison harness, CLI (including eval + serve subcommands + aclose lifecycle), Anthropic + OpenAI proxy compatibility (parsing, streaming heartbeat/deadline, force-model resolver, auth, ollama-down enrichment, concurrent requests), max-quality default policy, and config validation.
+362 tests across 31 files cover providers (including session reuse + concurrency-cap + per-class timeout-budget guards), verifiers (code/math/judge/heuristic, including the thinking-strip and code-execution hard-gate), self-consistency, escalation, refinement (with closed-loop output verification), abstention (including self-judge bias guards), bandit (selection + posterior updates + persistence), event bus + progress sink, LLM classifier (and its router wiring), retrieval (and its router wiring), eval harness + comparison harness, CLI (including eval + serve subcommands, the non-loopback-bind guard, and aclose lifecycle), Anthropic + OpenAI proxy compatibility (parsing, streaming heartbeat/deadline, force-model resolver, auth, Host-allowlist, error redaction, body validation, ollama-down enrichment, concurrent requests), the ensure-proxy hardening (run-dir perms, O_NOFOLLOW, kill verification), max-quality default policy, and config validation.
 
 ---
 
@@ -531,6 +531,9 @@ pytest tests/test_cli.py     # CLI: ask / eval / serve / quiet
 | ✅ Shipped | Verifier framework, self-consistency, calibrated abstention, bandit, eval harness, refinement, escalation, retrieval scaffold, event bus |
 | ✅ Shipped | Anthropic Messages API proxy + OpenAI Chat Completions proxy (drop-in backend for Claude Code, aider, and openai SDK) |
 | ✅ Shipped | Force-model honoring in proxy + live stderr progress lines + idempotent SessionStart auto-boot |
+| ✅ Shipped | Thinking-model safety: centralized chain-of-thought stripping at the candidate boundary, per-class generation timeout budgets (reasoning models aren't cut off at the chat timeout), closed-loop verification of refinement/escalation outputs |
+| ✅ Shipped | Security hardening: non-loopback-bind API-key requirement, Host-header allowlist, error redaction, request-body validation, private 0700 runtime dir with O_NOFOLLOW, code-execution hard-gate behind an operator-supplied sandbox |
+| ✅ Shipped | LLM classifier and retrieval wired into the router (opt-in via `classifier.mode: llm` / `retrieval.enabled`) |
 | 🛠 Next | Class-aware streaming with thinking-model-safe cancellation |
 | 💭 Considering | LLM classifier as default, retrieval for `general` tag by default, Strategy plugin registry via entry points, real tool-call translation in proxy |
 
@@ -562,7 +565,7 @@ fleet-router/
 ├── scripts/
 │   ├── fleet-toggle.sh        # shell-scoped opt-in for Claude Code backend
 │   └── fleet-ensure-proxy.py  # idempotent flock-guarded auto-boot
-└── tests/                     # 256 tests across 28 files
+└── tests/                     # 362 tests across 31 files
 ```
 
 ---
