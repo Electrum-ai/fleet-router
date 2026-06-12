@@ -42,6 +42,15 @@ from typing import Optional
 
 from evals.runner import aggregate, default_scorers, load_fixtures
 from evals.scorers import EvalCase, EvalResult, Scorer
+from evals.stats import DEFAULT_CONFIDENCE, SeedLike, paired_bootstrap
+
+# Deterministic default so the head-to-head bootstrap CI is reproducible.
+DEFAULT_COMPARE_SEED = 0xC0FFEE
+# The side-by-side comparison reports a DESCRIPTIVE interval, not a gate, so it
+# stays at the conventional 0.95. The regression gate in evals.runner defaults
+# to the higher DEFAULT_GATE_CONFIDENCE (0.975) to compensate for the
+# percentile bootstrap's mild anti-conservatism at small n; see evals.stats.
+DEFAULT_REPORT_CONFIDENCE = DEFAULT_CONFIDENCE
 
 
 async def _run_one_side(
@@ -72,8 +81,21 @@ async def compare(
     b: tuple[str, object],
     fixtures_dir: Path | str,
     scorers: Optional[dict[str, Scorer]] = None,
+    *,
+    confidence: float = DEFAULT_REPORT_CONFIDENCE,
+    seed: SeedLike = DEFAULT_COMPARE_SEED,
 ) -> dict:
-    """Run two routers through the same fixtures; report per-tag deltas."""
+    """Run two routers through the same fixtures; report per-tag deltas.
+
+    Beyond raw win counts and pp deltas, this reports a bootstrap confidence
+    interval on the mean per-case delta (b - a). Win counts say "who won more
+    cases"; the CI says whether that gap is distinguishable from sampling
+    noise — the same uncertainty discipline the regression gate uses.
+
+    Note: ``confidence`` here defaults to the descriptive 0.95 because this is
+    a report, not a gate. The regression gate (``evals.runner``) defaults to a
+    higher 0.975 to keep its false-positive rate at/below alpha at small n.
+    """
     label_a, router_a = a
     label_b, router_b = b
     cases = load_fixtures(fixtures_dir)
@@ -120,10 +142,45 @@ async def compare(
         f"\nHead-to-head: {label_a}={a_wins}  {label_b}={b_wins}  ties={ties}"
     )
 
+    # Bootstrap CI on the mean per-case delta (b - a). Overall, then per tag.
+    deltas = [r["delta"] for r in head_to_head]
+    overall_ci = paired_bootstrap(deltas, confidence=confidence, seed=seed)
+    pct = int(round(confidence * 100))
+    distinguishable = "yes" if (overall_ci.high < 0 or overall_ci.low > 0) else "no"
+    summary_lines.append(
+        f"Mean delta ({label_b} - {label_a}): {overall_ci.delta:+.3f}  "
+        f"{pct}% CI[{overall_ci.low:+.3f}, {overall_ci.high:+.3f}]  "
+        f"(distinguishable from noise: {distinguishable})"
+    )
+
+    per_tag_ci: dict[str, dict] = {}
+    deltas_by_tag: dict[str, list[float]] = {}
+    for r in head_to_head:
+        deltas_by_tag.setdefault(r["tag"], []).append(r["delta"])
+    for tag in sorted(deltas_by_tag):
+        ci = paired_bootstrap(deltas_by_tag[tag], confidence=confidence, seed=seed)
+        per_tag_ci[tag] = {
+            "delta": ci.delta, "low": ci.low, "high": ci.high, "n": ci.n,
+        }
+        summary_lines.append(
+            f"  {tag:12s}  mean delta={ci.delta:+.3f}  "
+            f"{pct}% CI[{ci.low:+.3f}, {ci.high:+.3f}]  (n={ci.n})"
+        )
+
     return {
         "labels": [label_a, label_b],
         "n_cases": len(cases),
         "aggregates": {label_a: agg_a, label_b: agg_b},
         "head_to_head": head_to_head,
+        "bootstrap": {
+            "confidence": confidence,
+            "overall": {
+                "delta": overall_ci.delta,
+                "low": overall_ci.low,
+                "high": overall_ci.high,
+                "n": overall_ci.n,
+            },
+            "per_tag": per_tag_ci,
+        },
         "summary": "\n".join(summary_lines),
     }

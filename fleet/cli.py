@@ -49,6 +49,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Eval mode only: save current aggregates as the new baseline",
     )
     parser.add_argument(
+        "--repeats", type=int, default=1, metavar="N",
+        help="Eval mode only: run each case N times for the paired "
+             "significance gate (default 1)",
+    )
+    parser.add_argument(
         "--serve", action="store_true",
         help="Launch Anthropic-compatible HTTP proxy (use with Claude Code)",
     )
@@ -109,9 +114,11 @@ def _run_ask(router: FleetRouter, args: argparse.Namespace) -> int:
 def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
     # Lazy import — eval module not needed for the common ask path.
     from evals.runner import (
-        aggregate, compare_to_baseline, load_fixtures, run_eval, save_baseline,
+        aggregate, compare_to_baseline, load_fixtures, run_eval_detailed,
+        save_baseline,
     )
 
+    repeats = max(1, int(getattr(args, "repeats", 1) or 1))
     fixtures_dir = Path(args.eval)
     try:
         cases = load_fixtures(fixtures_dir)
@@ -124,12 +131,12 @@ def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
 
     async def _run_and_close():
         try:
-            return await run_eval(router, cases)
+            return await run_eval_detailed(router, cases, repeats=repeats)
         finally:
             await router.aclose()
 
     try:
-        results = asyncio.run(_run_and_close())
+        per_case = asyncio.run(_run_and_close())
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
@@ -137,19 +144,32 @@ def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
         print(f"fleet: eval failed — {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
+    from evals.scorers import EvalResult as _EvalResult
+    results = [
+        _EvalResult(
+            case=pc.case,
+            answer=pc.answers[-1] if pc.answers else "",
+            score=pc.mean_score,
+            notes=pc.notes,
+        )
+        for pc in per_case
+    ]
     aggregates = aggregate(results)
 
     print(json.dumps({
         "n_cases": len(cases),
+        "repeats": repeats,
         "aggregates": aggregates,
     }, indent=2))
 
     if args.save_baseline:
-        save_baseline(aggregates, args.save_baseline)
+        save_baseline(aggregates, args.save_baseline, per_case=per_case)
         print(f"\nbaseline saved to {args.save_baseline}", file=sys.stderr)
 
     if args.baseline:
-        regressed, messages = compare_to_baseline(aggregates, args.baseline)
+        regressed, messages = compare_to_baseline(
+            aggregates, args.baseline, current_per_case=per_case,
+        )
         print("\n--- comparison ---", file=sys.stderr)
         for m in messages:
             print(m, file=sys.stderr)
