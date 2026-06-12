@@ -51,8 +51,22 @@ class ThresholdConfig:
     # ensemble + verifier-driven synthesis). Set to 0.8 to opt back into
     # the speed-vs-quality split at the classifier.
     single_confidence: float = 1.01
+    # Legacy session-wide budget. Retained as a backward-compatible source
+    # for `timeouts` when a config predates the per-class field.
     parallel_timeout: int = 60
     max_parallel: int = 3
+    # Per-model-class wall-clock budget (seconds) for one generation. A
+    # reasoning model (deepseek-v4-pro) routinely thinks for minutes; cutting
+    # it off at the chat budget returns None and degrades the round to its
+    # fast-chat survivors — and with a one-model reasoning pool, to
+    # "(all models failed)". The dispatcher resolves a model's class and
+    # applies its budget as a PER-REQUEST aiohttp ClientTimeout, which fully
+    # replaces (not caps) the provider's session default. The shared session
+    # is therefore sized to the chat budget; the reasoning class still gets
+    # its full per-request budget.
+    timeouts: dict[str, int] = field(
+        default_factory=lambda: {"chat": 60, "reasoning": 240}
+    )
 
 
 @dataclass
@@ -277,10 +291,32 @@ def load_config(path: Path | str | None = None) -> Config:
     thresh_raw = raw.get("thresholds", {})
     if not isinstance(thresh_raw, dict):
         thresh_raw = {}
+    parallel_timeout = _coerce_int(thresh_raw.get("parallel_timeout"), 60)
+    timeouts_raw = thresh_raw.get("timeouts")
+    if isinstance(timeouts_raw, dict):
+        # Explicit per-class budgets. Seed from the ThresholdConfig dataclass
+        # default (not a duplicated literal — so the two can't drift) so a
+        # partial mapping (e.g. {"reasoning": 300}) keeps chat at its default,
+        # then overlay coerced ints. Junk values are ignored (default kept).
+        timeouts = dict(ThresholdConfig().timeouts)
+        for k, v in timeouts_raw.items():
+            try:
+                timeouts[str(k)] = max(1, int(v))
+            except (TypeError, ValueError):
+                continue
+    else:
+        # Backward-compat: no `timeouts` block. Derive from parallel_timeout so
+        # existing configs don't suddenly cut reasoning models off at the chat
+        # budget — reasoning gets at least 240s.
+        timeouts = {
+            "chat": parallel_timeout,
+            "reasoning": max(parallel_timeout, 240),
+        }
     thresholds = ThresholdConfig(
         single_confidence=_coerce_float(thresh_raw.get("single_confidence"), 1.01),
-        parallel_timeout=_coerce_int(thresh_raw.get("parallel_timeout"), 60),
+        parallel_timeout=parallel_timeout,
         max_parallel=_coerce_int(thresh_raw.get("max_parallel"), 3),
+        timeouts=timeouts,
     )
 
     clf_raw = raw.get("classifier", {})

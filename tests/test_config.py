@@ -105,6 +105,57 @@ models:
     assert cfg.models["weird"].model_class == "chat"
 
 
+def test_timeouts_default_when_no_thresholds_block():
+    """Bare Config() gets the documented per-class defaults."""
+    cfg = Config()
+    assert cfg.thresholds.timeouts == {"chat": 60, "reasoning": 240}
+
+
+def test_timeouts_derived_from_parallel_timeout_when_absent(tmp_path):
+    """A config that only sets parallel_timeout (no `timeouts` block) derives
+    per-class budgets so reasoning models are never cut at the chat budget."""
+    yaml_text = """
+thresholds:
+  parallel_timeout: 90
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    # chat == parallel_timeout; reasoning == max(parallel_timeout, 240).
+    assert cfg.thresholds.timeouts == {"chat": 90, "reasoning": 240}
+
+
+def test_timeouts_derived_keeps_large_parallel_timeout_for_reasoning(tmp_path):
+    """If parallel_timeout already exceeds 240, reasoning derives to it."""
+    yaml_text = """
+thresholds:
+  parallel_timeout: 300
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.thresholds.timeouts == {"chat": 300, "reasoning": 300}
+
+
+def test_timeouts_explicit_parse_coerces_and_ignores_junk(tmp_path):
+    """Explicit per-class budgets are coerced to ints; junk values are ignored
+    and missing keys keep their defaults."""
+    yaml_text = """
+thresholds:
+  parallel_timeout: 60
+  timeouts:
+    chat: 30
+    reasoning: not-a-number
+    code: "120"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.thresholds.timeouts["chat"] == 30      # overridden
+    assert cfg.thresholds.timeouts["reasoning"] == 240  # junk ignored, default kept
+    assert cfg.thresholds.timeouts["code"] == 120     # coerced from string
+
+
 def test_ollama_api_key_parsed(tmp_path):
     yaml_text = """
 ollama:

@@ -33,7 +33,19 @@ class ProviderPool:
 
     @classmethod
     def from_config(cls, config: Config) -> "ProviderPool":
-        timeout = config.thresholds.parallel_timeout
+        # Size the shared session to the CHAT budget. aiohttp's per-request
+        # ClientTimeout *fully replaces* the session timeout (it is not a cap):
+        # `real_timeout = timeout if timeout is not sentinel else self._timeout`.
+        # So the dispatcher's per-request reasoning override (240s) takes full
+        # effect regardless of this value — and calls that set NO per-request
+        # timeout (the shared judge/classifier on this provider) correctly
+        # inherit the 60s chat default instead of a bloated max budget.
+        timeouts = config.thresholds.timeouts
+        timeout = (
+            timeouts.get("chat", config.thresholds.parallel_timeout)
+            if timeouts
+            else config.thresholds.parallel_timeout
+        )
         pool = cls()
         pool.register(OllamaProvider(
             base_url=config.ollama.base_url,

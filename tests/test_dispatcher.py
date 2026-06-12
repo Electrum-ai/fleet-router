@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fleet.dispatcher import EnsembleDispatcher
-from fleet.config import Config
+from fleet.config import Config, ModelEntry, ThresholdConfig, load_config
 
 
 def _setup_mock_post(
@@ -149,6 +149,105 @@ async def test_dispatch_system_prompt():
         result = await disp.run("hi", ["glm-5.1"], system="Be helpful")
         assert result == {"glm-5.1": "system result"}
         assert mock_post.call_args.kwargs["json"]["system"] == "Be helpful"
+
+
+# ---------- CHANGE 1: per-class timeout budgets ----------
+
+
+@pytest.mark.asyncio
+async def test_run_multi_assigns_per_class_timeout_budgets():
+    """Each model's GenerateRequest carries the budget for its model_class:
+    reasoning gets the larger budget, chat the smaller, and an unconfigured
+    model defaults to the chat budget."""
+    config = Config(
+        models={
+            "reasoner": ModelEntry(tags=["math"], model_class="reasoning"),
+            "chatter": ModelEntry(tags=["math"], model_class="chat"),
+        },
+        thresholds=ThresholdConfig(timeouts={"chat": 60, "reasoning": 240}),
+    )
+    disp = EnsembleDispatcher(config)
+
+    captured: dict[str, float | None] = {}
+
+    async def fake_generate(req):
+        captured[req.model] = req.timeout
+        return ["ok"]
+
+    with patch.object(disp._default_provider, "generate", side_effect=fake_generate):
+        await disp.run_multi("p", ["reasoner", "chatter", "unknown"], samples=1)
+
+    assert captured["reasoner"] == 240
+    assert captured["chatter"] == 60
+    assert captured["unknown"] == 60  # unconfigured → chat budget
+
+
+@pytest.mark.asyncio
+async def test_run_multi_reasoning_budget_derived_from_legacy_parallel_timeout(tmp_path):
+    """A config that predates `timeouts` and only sets `parallel_timeout` must
+    still give a reasoning-class model the larger derived budget (>= 240) —
+    not cut it off at the legacy chat budget."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "thresholds:\n"
+        "  parallel_timeout: 45\n"
+        "models:\n"
+        "  thinker:\n"
+        "    tags: [math]\n"
+        "    class: reasoning\n"
+        "  talker:\n"
+        "    tags: [math]\n"
+        "    class: chat\n"
+    )
+    config = load_config(config_path)
+    disp = EnsembleDispatcher(config)
+
+    captured: dict[str, float | None] = {}
+
+    async def fake_generate(req):
+        captured[req.model] = req.timeout
+        return ["ok"]
+
+    with patch.object(disp._default_provider, "generate", side_effect=fake_generate):
+        await disp.run_multi("p", ["thinker", "talker"], samples=1)
+
+    assert captured["thinker"] == 240  # derived max(45, 240)
+    assert captured["talker"] == 45    # derived chat budget
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_session_sized_to_chat_budget():
+    """The shared session default is the CHAT budget — NOT the max. aiohttp's
+    per-request ClientTimeout fully replaces (not caps) the session value, so a
+    reasoning per-request override still gets its full 240s even though the
+    session default is the smaller chat budget. Sizing the session to chat
+    keeps no-per-request-timeout callers (judge/classifier) on the 60s default
+    instead of inheriting a bloated max budget."""
+    config = Config(
+        thresholds=ThresholdConfig(timeouts={"chat": 60, "reasoning": 300}),
+    )
+    disp = EnsembleDispatcher(config)
+    # Session default is the chat budget, not max(class budgets).
+    assert disp._timeout == 60
+
+    # End-to-end guarantee: a reasoning model still earns its full per-request
+    # budget (300 here), which replaces the 60s session default.
+    config2 = Config(
+        models={"reasoner": ModelEntry(tags=["math"], model_class="reasoning")},
+        thresholds=ThresholdConfig(timeouts={"chat": 60, "reasoning": 240}),
+    )
+    disp2 = EnsembleDispatcher(config2)
+    captured: dict[str, float | None] = {}
+
+    async def fake_generate(req):
+        captured[req.model] = req.timeout
+        return ["ok"]
+
+    with patch.object(disp2._default_provider, "generate", side_effect=fake_generate):
+        await disp2.run_multi("p", ["reasoner"], samples=1)
+    # Per-request override (240) > session default (60): per-request replaces.
+    assert captured["reasoner"] == 240
+    assert disp2._timeout == 60
 
 
 @pytest.mark.asyncio

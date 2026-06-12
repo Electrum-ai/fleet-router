@@ -115,10 +115,20 @@ class OllamaProvider:
             payload["system"] = request.system
         if request.max_tokens is not None:
             payload["options"]["num_predict"] = request.max_tokens
+        post_kwargs: dict = {"json": payload}
+        if request.timeout is not None:
+            # Per-request total timeout for THIS request. aiohttp REPLACES the
+            # session-wide timeout with this value (it does not cap it):
+            # `real_timeout = timeout if timeout is not sentinel else
+            # self._timeout` in ClientSession._request. So a reasoning sample
+            # gets its full class budget (e.g. 240s) even though the shared
+            # session default is the smaller chat budget (60s). Requests that
+            # leave timeout=None fall back to that 60s session default.
+            post_kwargs["timeout"] = aiohttp.ClientTimeout(total=request.timeout)
         try:
             async with session.post(
                 f"{self._base_url}/api/generate",
-                json=payload,
+                **post_kwargs,
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.json()

@@ -47,6 +47,22 @@ _NUMBER_RE = re.compile(r"(?:" + _NUM + r")" + _FRACTION_TAIL)
 _FRACTION_RE = re.compile(r"^(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)$")
 
 
+def _select_majority_winner(
+    scored_with_answers: list[tuple[Candidate, Optional[str]]],
+    winner_answer: str,
+) -> Candidate:
+    """Among the candidates whose ANSWER is the majority answer, pick the one
+    with the longest explanation (proxy for show-your-work quality).
+
+    Selection is by answer MEMBERSHIP, not by float-equality on the score. When
+    agreement == 0.2 (e.g. a 1-of-5 plurality), the majority score collides with
+    the 0.2 "disagrees" constant, so a score-based filter would wrongly admit
+    disagreeing candidates into the pool. Membership is collision-proof.
+    """
+    pool = [c for c, ans in scored_with_answers if ans == winner_answer]
+    return max(pool, key=lambda c: len(c.text))
+
+
 def _normalize_float(f: float) -> str:
     """Canonicalize a float so '42', '42.0', '4.2e1' compare equal."""
     if f.is_integer():
@@ -143,24 +159,39 @@ class MathVerifier:
         agreement = winner_count / len(valid_answers)
 
         scored: list[Candidate] = []
+        scored_with_answers: list[tuple[Candidate, Optional[str]]] = []
         for c, ans in per_candidate:
             if ans is None:
-                scored.append(c.with_score(0.0, "no answer"))
+                sc = c.with_score(0.0, "no answer")
             elif ans == winner_answer:
-                scored.append(c.with_score(agreement, f"answer={ans} ({winner_count}/{len(valid_answers)} agree)"))
+                sc = c.with_score(agreement, f"answer={ans} ({winner_count}/{len(valid_answers)} agree)")
             else:
-                scored.append(c.with_score(0.2, f"answer={ans} (disagrees with majority {winner_answer})"))
+                sc = c.with_score(0.2, f"answer={ans} (disagrees with majority {winner_answer})")
+            scored.append(sc)
+            scored_with_answers.append((sc, ans))
 
-        # Pick winner: among candidates with the majority answer, prefer the longest
-        # explanation (proxy for show-your-work quality).
-        winners = [c for c in scored if c.score == agreement]
-        winner = max(winners, key=lambda c: len(c.text))
+        # Pick winner by majority-answer MEMBERSHIP (collision-proof at 0.2).
+        winner = _select_majority_winner(scored_with_answers, winner_answer)
 
-        # Abstain on tied vote with no clear majority on >2 distinct answers.
-        abstain = agreement < 0.5 and len(votes) > 1
+        # Abstain on an exact split / no clear majority. `<= 0.5` (not `< 0.5`)
+        # so a genuine tie — 3-vs-3 → agreement == 0.5 — abstains and escalates
+        # rather than picking an insertion-order-arbitrary winner.
+        #
+        # Deliberately, `<= 0.5` ALSO abstains on a 2-1-1 plurality (agreement
+        # == 0.5 with a clear single-vote lead): an answer carried by only half
+        # the votes is too weak to return confidently, so we abstain-first and
+        # let escalation arbitrate rather than ship a coin-flip plurality.
+        abstain = agreement <= 0.5 and len(votes) > 1
+
+        # A single valid numeric answer makes `agreement` a fake 1.0 (one vote,
+        # voting for itself). Mark scores unreliable so the bandit doesn't
+        # ingest an overconfident reward — mirrors JudgeVerifier's
+        # single-candidate handling.
+        scores_reliable = len(valid_answers) > 1
         return VerificationResult(
             winner=None if abstain else winner,
             all_scored=scored,
             rationale=f"majority answer: {winner_answer} ({winner_count}/{len(valid_answers)})",
             abstain=abstain,
+            scores_reliable=scores_reliable,
         )

@@ -21,8 +21,9 @@ from fleet.events import EventBus, ModelDispatched, PromptClassified, ResponseSy
 from fleet.registry import ModelRegistry
 from fleet.synthesizer import Synthesizer
 from fleet.text import strip_thinking
-from fleet.verifiers.base import VerificationResult
+from fleet.verifiers.base import Candidate, VerificationResult
 from fleet.verifiers.code import CodeVerifier
+from fleet.verifiers.heuristic import HeuristicVerifier
 from fleet.verifiers.judge import JudgeVerifier
 from fleet.verifiers.math import MathVerifier
 from fleet.verifiers.registry import VerifierRegistry
@@ -69,23 +70,33 @@ class FleetRouter:
 
         judge_key = self._config.synthesis.judge_model
         if judge_key:
-            entry = self._config.models.get(judge_key)
-            provider_name = entry.provider if entry else "ollama"
-            api_model = entry.api_model if entry and entry.api_model else judge_key
-            provider = self._dispatcher._pool.get(provider_name)
-            if provider is not None:
-                for tag in _JUDGE_TAGS:
-                    registry.register(JudgeVerifier(provider, api_model, tag=tag))
+            judges = [self._make_judge(judge_key, tag) for tag in _JUDGE_TAGS]
+            if all(j is not None for j in judges):
+                for j in judges:
+                    registry.register(j)
             else:
                 logger.warning(
-                    "judge provider %r not in pool; skipping JudgeVerifier",
-                    provider_name,
+                    "judge provider for %r not in pool; skipping JudgeVerifier",
+                    judge_key,
                 )
 
         return VerifierSynthesizer(
             registry,
             abstention_threshold=self._config.synthesis.abstention_threshold,
         )
+
+    def _make_judge(self, model_key: str, tag: str) -> Optional[JudgeVerifier]:
+        """Construct a JudgeVerifier bound to `model_key` for `tag`, or None
+        when that model's provider isn't in the pool. Shared by the registry
+        build and by the neutral-judge swap that defeats verify-step
+        self-preference (a judge grading its own escalated/refined answer)."""
+        entry = self._config.models.get(model_key)
+        provider_name = entry.provider if entry else "ollama"
+        api_model = entry.api_model if entry and entry.api_model else model_key
+        provider = self._dispatcher._pool.get(provider_name)
+        if provider is None:
+            return None
+        return JudgeVerifier(provider, api_model, tag=tag)
 
     def refresh(self) -> None:
         """Eagerly refresh the model registry."""
@@ -204,7 +215,7 @@ class FleetRouter:
         # Disagreement escalation: when verifier abstains OR winner score is
         # weak, ask a stronger model to arbitrate using all candidates as context.
         if self._should_escalate(result):
-            escalated = await self._escalate(prompt, result, system=system)
+            escalated = await self._escalate(prompt, result, tag, system=system)
             if escalated is not None:
                 return escalated
 
@@ -216,7 +227,7 @@ class FleetRouter:
         # Refinement: critique → revise pass on the winning answer.
         if self._config.refinement.enabled and result.winner is not None:
             refined = await self._refine(
-                prompt, winner_text,
+                prompt, winner_text, tag, result,
                 winner_model=result.winner.model, system=system,
             )
             if refined:
@@ -267,7 +278,7 @@ class FleetRouter:
         )
 
     async def _escalate(
-        self, prompt: str, result, system: str | None = None
+        self, prompt: str, result, tag: str, system: str | None = None
     ) -> str | None:
         configured_model = self._config.escalation.model
         if not configured_model:
@@ -300,7 +311,60 @@ class FleetRouter:
         if not escalated:
             return None
         # Strip the arbiter's own chain-of-thought before it reaches the user.
-        return strip_thinking(escalated) or None
+        escalated_clean = strip_thinking(escalated) or None
+        if escalated_clean is None:
+            return None
+        # Closed-loop verification: never return an unverified arbiter answer.
+        # Score it with the SAME tag verifier against the original candidates;
+        # accept only when it clears the abstention threshold AND verifies at
+        # least as well as the best original. Otherwise return None so the
+        # caller falls through to the abstention path.
+        if not await self._escalation_verified(
+            prompt, tag, escalated_clean, model, result
+        ):
+            logger.info(
+                "escalated answer from %r did not verify; abstaining instead",
+                model,
+            )
+            return None
+        return escalated_clean
+
+    async def _escalation_verified(
+        self, prompt: str, tag: str, answer: str, arbiter_model: str,
+        result: VerificationResult,
+    ) -> bool:
+        """True iff `answer` scores >= the abstention threshold AND >= the best
+        original candidate under the tag verifier. The arbiter answer is tagged
+        with sample_idx=-1 so it's identifiable after re-scoring.
+
+        Neutral-judge discipline (self-preference guard): if the tag verifier is
+        the LLM judge and the judge model IS the arbiter that wrote `answer`, we
+        swap in a neutral judge — a judge grading its own output over-rates it
+        (the same bias `_pick_arbiter` guards at production time). When no
+        neutral model exists, we conservatively return False (abstain) rather
+        than trust a self-graded score.
+        """
+        verify_cands = [
+            Candidate(model=arbiter_model, sample_idx=-1, text=answer)
+        ] + list(result.all_scored)
+        vres, ok = await self._score_neutral(prompt, verify_cands, tag, arbiter_model)
+        if not ok:
+            return False
+        esc_score = next(
+            (c.score for c in vres.all_scored if c.sample_idx == -1), None
+        )
+        if esc_score is None:
+            return False
+        # NOTE: esc_score comes from a re-score of the pool that INCLUDES the
+        # arbiter's own answer (a mild self-confirmation advantage), while
+        # best_original is the pre-escalation score the originals earned WITHOUT
+        # the arbiter in the set — the two aren't on identical footing. We
+        # accept that mild asymmetry: requiring esc_score >= best_original is
+        # already a conservative bar, and re-scoring the originals in isolation
+        # would discard the arbiter's relative ranking signal entirely.
+        best_original = max((c.score for c in result.all_scored), default=0.0)
+        threshold = self._config.synthesis.abstention_threshold
+        return esc_score >= threshold and esc_score >= best_original
 
     def _pick_arbiter(
         self, configured: str, candidates: set[str]
@@ -319,6 +383,42 @@ class FleetRouter:
                 return alt
         return None
 
+    def _is_heuristic_tag(self, tag: str) -> bool:
+        """True when the tag is scored by the HeuristicVerifier — whose
+        pairwise-similarity consensus is SYMMETRIC and therefore order-dependent
+        for a 2-candidate compare. Refinement accepts on such tags must not
+        trust an insertion-order 'winner'."""
+        return isinstance(self._verifier_synth.verifier_for(tag), HeuristicVerifier)
+
+    def _judge_model_for_tag(self, tag: str) -> Optional[str]:
+        """Registry key of the judge model iff the tag is actually scored by a
+        JudgeVerifier (else None). Used to detect verify-step self-preference."""
+        if isinstance(self._verifier_synth.verifier_for(tag), JudgeVerifier):
+            return self._config.synthesis.judge_model or None
+        return None
+
+    async def _score_neutral(
+        self, prompt: str, candidates: list[Candidate], tag: str,
+        producer_model: str,
+    ) -> tuple[Optional[VerificationResult], bool]:
+        """Score `candidates` with the tag verifier, but when that verifier is
+        the LLM judge AND the judge model is `producer_model` (the model whose
+        answer is under test), swap in a neutral judge bound to a different
+        available model. Returns (result, ok); ok=False means the judge equals
+        the producer and no neutral model exists — the caller must fall back
+        conservatively rather than trust a self-graded score."""
+        judge_key = self._judge_model_for_tag(tag)
+        if judge_key is not None and judge_key == producer_model:
+            neutral = self._pick_arbiter(judge_key, {producer_model})
+            if neutral is None:
+                return None, False
+            neutral_judge = self._make_judge(neutral, tag)
+            if neutral_judge is None:
+                return None, False
+            return await neutral_judge.aggregate(prompt, candidates), True
+        result = await self._verifier_synth.score_candidates(prompt, candidates, tag)
+        return result, True
+
     def _format_abstention(self, result, tag: str) -> str:
         """Calibrated 'I don't know' — surfaces the candidates so the user
         can judge for themselves rather than seeing a confident wrong answer."""
@@ -335,9 +435,22 @@ class FleetRouter:
         )
 
     async def _refine(
-        self, prompt: str, draft: str, winner_model: Optional[str] = None,
-        system: str | None = None,
+        self, prompt: str, draft: str, tag: str, result: VerificationResult,
+        winner_model: Optional[str] = None, system: str | None = None,
     ) -> str | None:
+        # Don't let an unverified rewrite overwrite a strong numeric majority:
+        # when the math vote already agrees strongly, skip refinement entirely.
+        # A verified arithmetic answer shouldn't be "improved" by prose.
+        if (
+            tag == "math"
+            and result.winner is not None
+            and result.winner.score >= 0.6
+        ):
+            logger.info(
+                "refinement skipped for math: majority agreement %.2f is strong",
+                result.winner.score,
+            )
+            return None
         configured = self._config.refinement.critique_model
         if not configured:
             return None
@@ -376,4 +489,80 @@ class FleetRouter:
         if not revised:
             return None
         # Strip the critic's chain-of-thought from the revised answer.
-        return strip_thinking(revised) or None
+        revised_clean = strip_thinking(revised) or None
+        if revised_clean is None:
+            return None
+        # Closed-loop verification: only accept the rewrite if the tag verifier
+        # judges it better than the original winner. On tie or worse, keep the
+        # original (return None) — a single unverified rewrite must never
+        # silently overwrite a verified answer.
+        if await self._refinement_improves(
+            prompt, tag, revised_clean, draft, result,
+            producer_model=critique_model,
+        ):
+            return revised_clean
+        return None
+
+    async def _refinement_improves(
+        self, prompt: str, tag: str, revised: str, original: str,
+        result: VerificationResult, producer_model: Optional[str] = None,
+    ) -> bool:
+        """True iff `revised` is judged better than `original` by the tag
+        verifier. Synthetic, DISTINCT model names keep the heuristic/judge
+        verifier from collapsing the two texts into one model bucket; sentinel
+        sample_idx values (-1 revised, -2 original) make them identifiable
+        after re-scoring.
+
+        Two regimes, because verifiers differ in how trustworthy their pairwise
+        signal is:
+
+        - Heuristic-backed tags (general/reasoning with no judge configured):
+          the verifier's consensus score is pairwise-SYMMETRIC, so a 2-candidate
+          compare always ties and the 'winner' is decided by insertion order —
+          pure noise. We re-score with the order SWAPPED and accept only when
+          `revised` wins BOTH orderings, i.e. the tag's non-symmetric tiebreak
+          (length / brevity / diversity) genuinely prefers it independent of
+          order. A symmetric tie therefore resolves to KEEPING THE ORIGINAL.
+
+        - Discriminative tags (judge / executable / math): the verifier gives a
+          real asymmetric score, so a single strict `revised > original` is
+          enough. For judge tags we additionally apply the neutral-judge guard
+          (`_score_neutral`) so the critic can't grade its own rewrite.
+        """
+        revised_cand = Candidate(model="__refined__", sample_idx=-1, text=revised)
+        original_cand = Candidate(model="__original__", sample_idx=-2, text=original)
+
+        if self._is_heuristic_tag(tag):
+            fwd = await self._verifier_synth.score_candidates(
+                prompt, [revised_cand, original_cand], tag
+            )
+            rev = self._score_for(fwd, -1)
+            orig = self._score_for(fwd, -2)
+            if not (rev > orig):
+                return False
+            # Swap order: an order-dependent symmetric tie flips here, so only a
+            # genuine non-symmetric preference survives both passes.
+            swp = await self._verifier_synth.score_candidates(
+                prompt, [original_cand, revised_cand], tag
+            )
+            rev_sw = self._score_for(swp, -1)
+            orig_sw = self._score_for(swp, -2)
+            return rev_sw > orig_sw
+
+        cands = [revised_cand, original_cand]
+        if tag == "math":
+            # Include the original sample pool so the majority vote is
+            # meaningful — two lone candidates can't out-vote a 7-sample round.
+            cands.extend(result.all_scored)
+        vres, ok = await self._score_neutral(prompt, cands, tag, producer_model or "")
+        if not ok:
+            # Judge == critic and no neutral judge available → don't trust a
+            # self-graded score; keep the original.
+            return False
+        return self._score_for(vres, -1) > self._score_for(vres, -2)
+
+    @staticmethod
+    def _score_for(vres: VerificationResult, sample_idx: int) -> float:
+        return next(
+            (c.score for c in vres.all_scored if c.sample_idx == sample_idx), 0.0
+        )

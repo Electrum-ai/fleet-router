@@ -116,6 +116,41 @@ async def test_synthesizer_strips_thinking_at_candidate_boundary():
     assert "secret reasoning" in result.winner.raw_text
 
 
+def test_apply_abstention_preserves_scores_reliable():
+    """F7: an unreliable result that trips the abstention threshold must stay
+    unreliable through the rebuild. _update_bandit runs even on abstain, so a
+    reset-to-True here would leak judge-failure noise into the posteriors."""
+    s = VerifierSynthesizer(VerifierRegistry(), abstention_threshold=0.4)
+
+    # Below-threshold winner branch.
+    low = Candidate("m", 0, "x", score=0.2)
+    unreliable = VerificationResult(
+        winner=low, all_scored=[low], rationale="judge unavailable",
+        scores_reliable=False,
+    )
+    out = s._apply_abstention(unreliable)
+    assert out.abstain is True
+    assert out.winner is None
+    assert out.scores_reliable is False
+
+    # winner-is-None branch.
+    none_winner = VerificationResult(
+        winner=None, all_scored=[low], rationale="no winner",
+        scores_reliable=False,
+    )
+    out2 = s._apply_abstention(none_winner)
+    assert out2.abstain is True
+    assert out2.scores_reliable is False
+
+    # A reliable result that abstains stays reliable (no regression).
+    reliable = VerificationResult(
+        winner=low, all_scored=[low], rationale="low", scores_reliable=True,
+    )
+    out3 = s._apply_abstention(reliable)
+    assert out3.abstain is True
+    assert out3.scores_reliable is True
+
+
 @pytest.mark.asyncio
 async def test_synthesizer_drops_all_thinking_candidate():
     """A sample that is ONLY a <think> block collapses to empty and must not

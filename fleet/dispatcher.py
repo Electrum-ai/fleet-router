@@ -28,7 +28,17 @@ class EnsembleDispatcher:
     ):
         self._config = config
         self._pool = pool or ProviderPool.from_config(config)
-        self._timeout = config.thresholds.parallel_timeout
+        # The shared session is sized to the CHAT budget — it is only the
+        # DEFAULT for requests that don't set their own timeout. aiohttp's
+        # per-request ClientTimeout fully replaces (not caps) the session
+        # value, so the reasoning class still gets its full 240s via the
+        # per-request GenerateRequest.timeout set below.
+        timeouts = config.thresholds.timeouts
+        self._timeout = (
+            timeouts.get("chat", config.thresholds.parallel_timeout)
+            if timeouts
+            else config.thresholds.parallel_timeout
+        )
         # Fallback provider for models that aren't in config (test compat,
         # ad-hoc CLI use). Always Ollama with the configured base_url.
         self._default_provider: Provider = (
@@ -62,21 +72,29 @@ class EnsembleDispatcher:
         means every sample failed."""
         if not models:
             return {}
+        timeouts = self._config.thresholds.timeouts
+        chat_budget = timeouts.get("chat", self._timeout)
         plan: list[tuple[str, Provider, GenerateRequest]] = []
         for name in models:
             entry = self._config.models.get(name)
             if entry is not None:
                 provider = self._pool.get(entry.provider) or self._default_provider
                 api_model = entry.api_model or name
+                model_class = entry.model_class
             else:
+                # Unconfigured / ad-hoc models default to the chat budget — a
+                # reasoning model must be declared `class: reasoning` to earn
+                # the larger timeout.
                 provider = self._default_provider
                 api_model = name
+                model_class = "chat"
             req = GenerateRequest(
                 model=api_model,
                 prompt=prompt,
                 system=system,
                 temperature=temperature,
                 samples=samples,
+                timeout=timeouts.get(model_class, chat_budget),
             )
             plan.append((name, provider, req))
 

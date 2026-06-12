@@ -1,7 +1,11 @@
 import pytest
 
 from fleet.verifiers.base import Candidate
-from fleet.verifiers.math import MathVerifier, _extract_final_answer
+from fleet.verifiers.math import (
+    MathVerifier,
+    _extract_final_answer,
+    _select_majority_winner,
+)
 
 
 def test_extract_final_answer_explicit_marker():
@@ -162,3 +166,74 @@ async def test_math_verifier_strips_thinking_before_extract():
     assert result.winner is not None
     # Both should agree on 7 — thinking tokens shouldn't pollute extraction.
     assert "7" in result.winner.text
+
+
+# ---------- CHANGE 3: tie abstention + winner membership + reliability ----------
+
+
+@pytest.mark.asyncio
+async def test_math_verifier_abstains_on_even_split():
+    """3-vs-3 split → agreement == 0.5 → genuine tie → abstain (was `< 0.5`,
+    which let an exact split pick an insertion-order-arbitrary winner)."""
+    v = MathVerifier()
+    candidates = [
+        Candidate("a", 0, "Answer: 1"),
+        Candidate("b", 0, "Answer: 1"),
+        Candidate("c", 0, "Answer: 1"),
+        Candidate("d", 0, "Answer: 2"),
+        Candidate("e", 0, "Answer: 2"),
+        Candidate("f", 0, "Answer: 2"),
+    ]
+    result = await v.aggregate("p", candidates)
+    assert result.abstain
+    assert result.winner is None
+
+
+def test_select_majority_winner_uses_answer_membership_at_0_2_agreement():
+    """Regression for the winner-selection collision: at agreement == 0.2 the
+    majority score equals the 0.2 "disagrees" constant. A score-based filter
+    would admit a longer DISAGREEING candidate; membership-based selection must
+    return the candidate that actually holds the majority answer.
+
+    (At agreement 0.2 the verifier abstains, so `winner` is never surfaced —
+    we test the selection helper directly to prove the fix.)"""
+    # 5 distinct answers → plurality "7" with 1 vote → agreement == 1/5 == 0.2.
+    # The disagreeing "3" candidate is the LONGEST and shares the 0.2 score.
+    scored_with_answers = [
+        (Candidate("a", 0, "7").with_score(0.2), "7"),
+        (Candidate("b", 0, "1").with_score(0.2), "1"),
+        (Candidate("c", 0, "a very long but WRONG explanation ending in 3").with_score(0.2), "3"),
+        (Candidate("d", 0, "2").with_score(0.2), "2"),
+        (Candidate("e", 0, "4").with_score(0.2), "4"),
+    ]
+    winner = _select_majority_winner(scored_with_answers, "7")
+    assert winner.text == "7"  # the majority-answer candidate, not the long "3"
+
+
+@pytest.mark.asyncio
+async def test_math_verifier_single_valid_answer_marks_unreliable():
+    """Only one candidate produced a parseable number → agreement is a fake
+    1.0 → scores_reliable=False so the bandit doesn't ingest the overconfident
+    reward (mirrors JudgeVerifier's single-candidate handling)."""
+    v = MathVerifier()
+    candidates = [
+        Candidate("a", 0, "The answer is 5"),
+        Candidate("b", 0, "I'm really not sure about this one"),
+    ]
+    result = await v.aggregate("p", candidates)
+    assert result.winner is not None
+    assert "5" in result.winner.text
+    assert result.scores_reliable is False
+
+
+@pytest.mark.asyncio
+async def test_math_verifier_multiple_valid_answers_stay_reliable():
+    """Two+ valid numeric answers → genuine consensus → scores_reliable=True."""
+    v = MathVerifier()
+    candidates = [
+        Candidate("a", 0, "Answer: 5"),
+        Candidate("b", 0, "The answer is 5"),
+    ]
+    result = await v.aggregate("p", candidates)
+    assert result.winner is not None
+    assert result.scores_reliable is True
