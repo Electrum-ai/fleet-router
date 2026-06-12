@@ -270,6 +270,47 @@ synthesis:
         "firejail --net=none --private={dir} {python} {file}"
 
 
+def test_bandit_decay_and_seeding_defaults():
+    """Defaults: no decay (1.0), mild priority seeding (0.5)."""
+    cfg = Config()
+    assert cfg.bandit.decay == 1.0
+    assert cfg.bandit.priority_prior_strength == 0.5
+
+
+def test_bandit_decay_and_seeding_parsed(tmp_path):
+    yaml_text = """
+bandit:
+  decay: 0.9
+  priority_prior_strength: 1.5
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.bandit.decay == 0.9
+    assert cfg.bandit.priority_prior_strength == 1.5
+
+
+def test_bandit_decay_out_of_range_falls_back_to_one(tmp_path):
+    """decay outside (0, 1] (and junk) coerces to 1.0 = no decay."""
+    for bad in ("0.0", "-0.5", "1.5", "notanumber"):
+        yaml_text = f"bandit:\n  decay: {bad}\n"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml_text)
+        cfg = load_config(config_path)
+        assert cfg.bandit.decay == 1.0
+
+
+def test_bandit_negative_seeding_strength_clamped_to_zero(tmp_path):
+    yaml_text = """
+bandit:
+  priority_prior_strength: -2.0
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.bandit.priority_prior_strength == 0.0
+
+
 def test_synthesis_code_execute_sandbox_coerces_non_string(tmp_path):
     yaml_text = """
 synthesis:

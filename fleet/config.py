@@ -166,6 +166,18 @@ class BanditConfig:
     enabled: bool = True
     # Where to persist Beta posteriors. Empty = in-memory only.
     state_path: str = ""
+    # Exponential forgetting in (0, 1]. 1.0 = no decay (learned posteriors
+    # accumulate forever, exact historical behavior). <1.0 shrinks the
+    # learned excess over the prior toward the prior before each new
+    # observation, so a model that was good then silently changed under the
+    # same tag (Ollama cloud upgrades) recovers faster.
+    decay: float = 1.0
+    # Cold-start priority seeding strength. 0.0 = uniform Beta(1,1) for every
+    # fresh arm (random-shuffle cold start). >0.0 seeds an unseen arm with a
+    # mild priority-biased prior (alpha = 1 + strength/priority, beta = 1) so
+    # the human priority ordering dominates the zero-evidence cold start; a
+    # few real observations quickly wash it out. Default 0.5 = mild.
+    priority_prior_strength: float = 0.5
 
 
 @dataclass
@@ -396,9 +408,18 @@ def load_config(path: Path | str | None = None) -> Config:
     )
 
     bandit_raw = raw.get("bandit", {}) if isinstance(raw.get("bandit"), dict) else {}
+    # Decay clamps to (0, 1]; anything outside (junk, 0, negatives, >1) falls
+    # back to 1.0 = no decay, the safe historical default.
+    decay = _coerce_float(bandit_raw.get("decay"), 1.0)
+    if not (0.0 < decay <= 1.0):
+        decay = 1.0
+    # Seeding strength clamps to >= 0.0 (0.0 disables seeding).
+    strength = max(0.0, _coerce_float(bandit_raw.get("priority_prior_strength"), 0.5))
     bandit = BanditConfig(
         enabled=bool(bandit_raw.get("enabled", True)),
         state_path=str(bandit_raw.get("state_path", "")),
+        decay=decay,
+        priority_prior_strength=strength,
     )
 
     return Config(

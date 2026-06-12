@@ -485,7 +485,7 @@ Beats a confident wrong answer.
 
 ### Outcome-Driven Bandit
 
-Thompson sampling over `(tag, model)` Beta posteriors. **Reward signal = verifier/judge score in [0,1]** — never latency, never cost. Each sampled candidate is an independent observation, so `samples_per_model=5` gives the bandit 5× more signal per dispatch. State persists atomically to `~/.fleet/bandit.json`. With bandit enabled, the router Thompson-ranks the **full** tag-matching pool (not just `max_parallel` head-of-line candidates) so it can explore.
+Thompson sampling over `(tag, model)` Beta posteriors. **Reward signal = verifier/judge score in [0,1]** — never latency, never cost. The N samples a model emits in one round are correlated draws from a single generation, so they collapse to **one aggregated observation per model per round** (the mean candidate score) — `samples_per_model=5` sharpens that observation's score *estimate*, it does not give the bandit 5× the observation count. Two knobs tune the prior: `bandit.decay` (in `(0,1]`, default `1.0` = no decay) applies exponential forgetting so stale evidence from a since-upgraded model fades; `bandit.priority_prior_strength` (default `0.5`) seeds a fresh arm with a mild priority-biased prior (`alpha = 1 + strength/priority`, `beta = 1`) so the cold start respects the configured priority ordering instead of random-shuffling. State persists atomically to `~/.fleet/bandit.json`. With bandit enabled, the router Thompson-ranks the **full** tag-matching pool (not just `max_parallel` head-of-line candidates) so it can explore.
 
 ---
 

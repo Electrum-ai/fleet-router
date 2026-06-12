@@ -127,3 +127,99 @@ def test_reward_clipped_to_zero_one():
     # Second call: a += 0.0, b += 1.0
     assert abs(a - 2.0) < 1e-6
     assert abs(beta - 2.0) < 1e-6
+
+
+# --- FIX 2: recency decay --------------------------------------------------
+
+def test_decay_one_is_byte_identical_to_no_decay():
+    """decay=1.0 must reproduce the historical no-decay path exactly."""
+    b_default = ThompsonBandit()
+    b_decay1 = ThompsonBandit(decay=1.0)
+    for r in [1.0, 0.0, 0.7, 1.0, 0.3, 0.0]:
+        b_default.update("t", "m", r)
+        b_decay1.update("t", "m", r)
+    assert b_default._params("t", "m") == b_decay1._params("t", "m")
+
+
+def test_decay_out_of_range_falls_back_to_no_decay():
+    """Junk decay (<=0 or >1) is coerced to 1.0 — never silently forgetful."""
+    for bad in (0.0, -0.5, 1.5, 2.0):
+        b = ThompsonBandit(decay=bad)
+        b.update("t", "m", 1.0)
+        b.update("t", "m", 1.0)
+        a, beta = b._params("t", "m")
+        # No decay → uniform prior + two successes: alpha=3, beta=1.
+        assert abs(a - 3.0) < 1e-6
+        assert abs(beta - 1.0) < 1e-6
+
+
+def test_decay_shrinks_old_mass_toward_prior_before_new_obs():
+    """decay=0.5 halves the learned excess over the prior before each update."""
+    b = ThompsonBandit(decay=0.5)
+    # From uniform prior (1,1): no excess to decay, then +1 → (2,1).
+    b.update("t", "m", 1.0)
+    a, beta = b._params("t", "m")
+    assert abs(a - 2.0) < 1e-6 and abs(beta - 1.0) < 1e-6
+    # Next update: excess alpha = 2-1=1 → 1 + 1*0.5 = 1.5; beta unchanged;
+    # then +1 → (2.5, 1.0).
+    b.update("t", "m", 1.0)
+    a, beta = b._params("t", "m")
+    assert abs(a - 2.5) < 1e-6 and abs(beta - 1.0) < 1e-6
+
+
+def test_decay_recovers_faster_when_good_model_goes_bad():
+    """A model that was good then turns bad sits lower (recovers faster) with
+    decay<1 than with decay=1 — stale 'good' evidence is forgotten."""
+    b_no = ThompsonBandit(decay=1.0)
+    b_dec = ThompsonBandit(decay=0.6)
+    sequence = [1.0] * 10 + [0.0] * 5  # good streak, then bad streak
+    for r in sequence:
+        b_no.update("t", "m", r)
+        b_dec.update("t", "m", r)
+    assert b_dec.posterior_mean("t", "m") < b_no.posterior_mean("t", "m")
+
+
+# --- FIX 3: cold-start priority seeding -------------------------------------
+
+def test_prior_provider_seeds_unseen_arm():
+    """An unseen arm initializes from the provider instead of uniform."""
+    def provider(tag, model):
+        return {"a": (1.5, 1.0), "b": (1.25, 1.0)}[model]
+
+    b = ThompsonBandit(prior_provider=provider)
+    assert abs(b.posterior_mean("t", "a") - 0.6) < 1e-6           # 1.5/2.5
+    assert abs(b.posterior_mean("t", "b") - (1.25 / 2.25)) < 1e-6
+
+
+def test_prior_provider_only_fires_for_unseen_arms():
+    """Once an arm exists (loaded or learned), the provider must not reseed."""
+    state = {"hits": 0}
+
+    def provider(tag, model):
+        state["hits"] += 1
+        return 1.5, 1.0
+
+    b = ThompsonBandit(prior_provider=provider)
+    b.update("t", "m", 1.0)   # creates the arm (1 provider hit for init)
+    hits_after_create = state["hits"]
+    b.update("t", "m", 0.0)   # arm exists; decay off, so no extra provider call
+    b.update("t", "m", 1.0)
+    # No decay (default 1.0) → provider not consulted again after creation.
+    assert state["hits"] == hits_after_create
+
+
+def test_prior_provider_decays_toward_its_own_seed():
+    """With decay<1 a seeded arm forgets toward its SEED, not uniform."""
+    def provider(tag, model):
+        return 1.5, 1.0  # seeded prior mean 0.6
+
+    b = ThompsonBandit(decay=0.5, prior_provider=provider)
+    # Create arm: seeded (1.5, 1.0); no excess yet; +1 → (2.5, 1.0).
+    b.update("t", "m", 1.0)
+    a, beta = b._params("t", "m")
+    assert abs(a - 2.5) < 1e-6 and abs(beta - 1.0) < 1e-6
+    # Next: excess alpha = 2.5-1.5 = 1.0 → 1.5 + 1.0*0.5 = 2.0; beta stays 1.0;
+    # +1 → (3.0, 1.0). The 1.5 seed floor is preserved, not pulled to 1.0.
+    b.update("t", "m", 1.0)
+    a, beta = b._params("t", "m")
+    assert abs(a - 3.0) < 1e-6 and abs(beta - 1.0) < 1e-6

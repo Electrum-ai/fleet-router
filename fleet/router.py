@@ -64,6 +64,8 @@ class FleetRouter:
         if self._config.bandit.enabled:
             self._bandit = ThompsonBandit(
                 state_path=self._config.bandit.state_path or None,
+                decay=self._config.bandit.decay,
+                prior_provider=self._make_prior_provider(),
             )
 
     def _build_llm_classifier(self) -> Optional[LLMClassifier]:
@@ -345,9 +347,12 @@ class FleetRouter:
             winner_score=result.winner.score if result.winner else None,
             abstain=result.abstain,
         ))
-        # Feed verifier scores back into the bandit's posteriors. Each sampled
-        # candidate is an independent observation — with samples_per_model=5
-        # the bandit gets 5× more signal per dispatch.
+        # Feed verifier scores back into the bandit's posteriors. The N
+        # candidates a model emits in one round are correlated samples of the
+        # SAME generation, not N independent Bernoulli trials, so they collapse
+        # to ONE aggregated observation per model (their mean score). More
+        # samples sharpen that observation's score ESTIMATE; they do NOT
+        # multiply the observation count.
         self._update_bandit(tag, result)
 
         # Disagreement escalation: when verifier abstains OR winner score is
@@ -385,6 +390,31 @@ class FleetRouter:
             return self._bandit.rank(tag, pool)[:top_n]
         return pool[:top_n]
 
+    def _make_prior_provider(self):
+        """Build a (tag, model) -> (alpha, beta) prior seeder from configured
+        model priorities, or None when seeding is disabled. Used by the bandit
+        ONLY when an arm is first created, so a fresh state file respects the
+        human priority ordering instead of random-shuffling all arms.
+
+        Mapping: alpha = 1 + strength/priority, beta = 1. Priority 1 (highest)
+        gets the highest prior mean; larger priority numbers tend toward
+        uniform. Total prior mass stays low (alpha < 2) so a few real
+        observations dominate quickly. Unknown models fall back to the
+        ModelEntry default priority (99) ≈ uniform."""
+        strength = self._config.bandit.priority_prior_strength
+        if strength <= 0.0:
+            return None
+        models = self._config.models
+
+        def provider(tag: str, model: str) -> tuple[float, float]:
+            entry = models.get(model)
+            priority = entry.priority if entry else 99
+            if priority < 1:
+                priority = 1  # guard against div-by-zero / negative configs
+            return 1.0 + strength / priority, 1.0
+
+        return provider
+
     def _update_bandit(self, tag: str, result: VerificationResult) -> None:
         """Push verifier scores into the bandit posteriors. Skipped when:
         - bandit disabled, OR
@@ -392,11 +422,22 @@ class FleetRouter:
         - the verifier marked its scores unreliable (judge crashed,
           returned empty, output unparseable, or only one candidate).
           Updating from those would poison posteriors with all-0.5 noise
-          and prevent the bandit from ever discriminating between models."""
+          and prevent the bandit from ever discriminating between models.
+
+        Candidates are aggregated to ONE observation per model per round: the
+        N samples a model emits are correlated draws from the same generation,
+        so feeding each as an independent Bernoulli trial would make posteriors
+        overconfident by ~sqrt(N) and let one lucky round lock in exploitation.
+        We average a model's candidate scores and apply a single update."""
         if self._bandit is None or not result.all_scored or not result.scores_reliable:
             return
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
         for c in result.all_scored:
-            self._bandit.update(tag, c.model, c.score)
+            sums[c.model] = sums.get(c.model, 0.0) + c.score
+            counts[c.model] = counts.get(c.model, 0) + 1
+        for model, total in sums.items():
+            self._bandit.update(tag, model, total / counts[model])
 
     def _sample_count(self, tag: str) -> int:
         by_tag = self._config.sampling.samples_by_tag

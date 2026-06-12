@@ -77,3 +77,13 @@ retrieval:
 bandit:
   enabled: true
   state_path: ~/.fleet/bandit.json
+  # Exponential forgetting in (0, 1]. 1.0 = no decay (posteriors accumulate
+  # forever). <1.0 shrinks the learned excess over the prior toward the prior
+  # before each new observation, so a model that silently changed under the
+  # same tag recovers faster.
+  decay: 1.0
+  # Cold-start priority seeding. 0.0 = uniform Beta(1,1) for every fresh arm.
+  # >0.0 seeds an unseen arm with a mild priority-biased prior
+  # (alpha = 1 + strength/priority, beta = 1) so the cold start respects the
+  # configured priority order. A few real observations quickly wash it out.
+  priority_prior_strength: 0.5
