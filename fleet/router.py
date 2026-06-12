@@ -18,7 +18,9 @@ from fleet.classifier import TaskClassifier
 from fleet.config import Config
 from fleet.dispatcher import EnsembleDispatcher
 from fleet.events import EventBus, ModelDispatched, PromptClassified, ResponseSynthesized
+from fleet.llm_classifier import LLMClassifier
 from fleet.registry import ModelRegistry
+from fleet.retrieval import RetrievalProvider, build_retrieval_provider
 from fleet.synthesizer import Synthesizer
 from fleet.text import strip_thinking
 from fleet.verifiers.base import Candidate, VerificationResult
@@ -48,17 +50,74 @@ class FleetRouter:
         events: Optional[EventBus] = None,
     ):
         self._config = config or Config()
+        # Keyword classifier is always built: it is the LLM classifier's
+        # fallback AND the path callers take when LLM mode isn't configured.
         self._classifier = TaskClassifier(self._config.classifier.embeddings_model)
         self._registry = ModelRegistry(self._config)
         self._dispatcher = EnsembleDispatcher(self._config)
         self._synthesizer = Synthesizer()  # heuristic fallback path
         self._verifier_synth = self._build_verifier_synth()
+        self._llm_classifier = self._build_llm_classifier()
+        self._retrieval = self._build_retrieval()
         self._events = events or EventBus()
         self._bandit: Optional[ThompsonBandit] = None
         if self._config.bandit.enabled:
             self._bandit = ThompsonBandit(
                 state_path=self._config.bandit.state_path or None,
             )
+
+    def _build_llm_classifier(self) -> Optional[LLMClassifier]:
+        """Build an LLMClassifier when classifier.mode == 'llm' and a
+        llm_model is configured. Degrades to None (keyword) when the mode
+        isn't 'llm', the model name is empty, or the provider isn't in the
+        pool — every case logs why and leaves the keyword path intact."""
+        clf = self._config.classifier
+        if clf.mode != "llm":
+            return None
+        if not clf.llm_model:
+            logger.warning(
+                "classifier.mode='llm' but classifier.llm_model is empty; "
+                "falling back to keyword classification"
+            )
+            return None
+        # Resolve the provider the same way _make_judge does: honor the
+        # model entry's provider, defaulting to ollama.
+        entry = self._config.models.get(clf.llm_model)
+        provider_name = entry.provider if entry else "ollama"
+        api_model = entry.api_model if entry and entry.api_model else clf.llm_model
+        provider = self._dispatcher._pool.get(provider_name)
+        if provider is None:
+            logger.warning(
+                "classifier provider %r for llm_model %r not in pool; "
+                "falling back to keyword classification",
+                provider_name, clf.llm_model,
+            )
+            return None
+        return LLMClassifier(provider, api_model, fallback=self._classifier)
+
+    def _build_retrieval(self) -> Optional[RetrievalProvider]:
+        """Build the configured retrieval provider when retrieval.enabled,
+        else None (no construction, no call)."""
+        if not self._config.retrieval.enabled:
+            return None
+        if not self._config.retrieval.tags:
+            logger.warning(
+                "retrieval enabled but no tags configured; augmentation is a no-op"
+            )
+        name = self._config.retrieval.provider
+        if name not in ("noop", "websearch"):
+            logger.warning(
+                "unknown retrieval provider %r; falling back to noop (no augmentation)",
+                name,
+            )
+        return build_retrieval_provider(name)
+
+    async def _classify(self, prompt: str) -> tuple[str, float]:
+        """Classify via the LLM classifier when wired (it falls back to
+        keyword internally on any failure), else the sync keyword path."""
+        if self._llm_classifier is not None:
+            return await self._llm_classifier.classify(prompt)
+        return self._classifier.classify(prompt)
 
     def _build_verifier_synth(self) -> VerifierSynthesizer:
         registry = VerifierRegistry()
@@ -132,12 +191,32 @@ class FleetRouter:
                 return cleaned
             return ERROR_ALL_MODELS_FAILED
 
-        tag, confidence = self._classifier.classify(prompt)
+        tag, confidence = await self._classify(prompt)
         self._events.emit(PromptClassified(tag=tag, confidence=confidence, prompt=prompt))
 
+        # Retrieval augmentation: classification used the ORIGINAL prompt; only
+        # the dispatched prompt is grounded with retrieved context. Failures are
+        # non-fatal (providers swallow their own errors and return ""), and an
+        # empty context leaves the prompt byte-for-byte unchanged.
+        dispatch_prompt = await self._augment(prompt, tag)
+
         if force_parallel or confidence < self._config.thresholds.single_confidence:
-            return await self._parallel(prompt, tag, system=system)
-        return await self._single(prompt, tag, system=system)
+            return await self._parallel(dispatch_prompt, tag, system=system)
+        return await self._single(dispatch_prompt, tag, system=system)
+
+    async def _augment(self, prompt: str, tag: str) -> str:
+        """Prepend retrieved context to `prompt` when retrieval is enabled and
+        `tag` is configured for augmentation. Returns the prompt unchanged when
+        retrieval is off, the tag isn't configured, or the context is empty."""
+        if self._retrieval is None or tag not in self._config.retrieval.tags:
+            return prompt
+        context = await self._retrieval.retrieve(
+            prompt, self._config.retrieval.max_chars
+        )
+        if not context:
+            return prompt
+        logger.debug("retrieval augmented prompt for tag=%r (%d chars)", tag, len(context))
+        return f"{context}\n\n{prompt}"
 
     async def _single(
         self, prompt: str, tag: str, system: str | None = None
