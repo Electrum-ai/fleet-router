@@ -1,5 +1,11 @@
 <div align="center">
 
+```
+   ┌─┐┬  ┌─┐┌─┐┌┬┐  ┬─┐┌─┐┬ ┬┌┬┐┌─┐┬─┐
+   ├┤ │  ├┤ ├┤  │   ├┬┘│ ││ │ │ ├┤ ├┬┘
+   ┴  ┴─┘└─┘└─┘ ┴   ┴└─└─┘└─┘ ┴ └─┘┴└─
+```
+
 # ⚡ Fleet Router
 
 ### Adaptive parallel LLM router with **verifier-driven synthesis** for open-source models on Ollama
