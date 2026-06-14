@@ -342,11 +342,11 @@ def test_resolve_force_model_returns_known_bare_name():
 
 def test_resolve_force_model_strips_provider_prefixes():
     """aider/litellm prefix model names with `openai/` etc."""
-    router = _RouterWithModels(["glm-5.1", "kimi-k2.6"])
+    router = _RouterWithModels(["glm-5.1", "kimi-k2.7"])
     assert _resolve_force_model("openai/glm-5.1", router) == "glm-5.1"
     assert _resolve_force_model("anthropic/glm-5.1", router) == "glm-5.1"
-    assert _resolve_force_model("ollama/kimi-k2.6", router) == "kimi-k2.6"
-    assert _resolve_force_model("fleet/kimi-k2.6", router) == "kimi-k2.6"
+    assert _resolve_force_model("ollama/kimi-k2.7", router) == "kimi-k2.7"
+    assert _resolve_force_model("fleet/kimi-k2.7", router) == "kimi-k2.7"
 
 
 def test_resolve_force_model_tolerates_cloud_suffix():

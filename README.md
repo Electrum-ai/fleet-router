@@ -259,7 +259,7 @@ This project routes **only to open-source LLMs running on Ollama** (local or `:c
 
 | Model | Best For | Ollama Tag | Priority |
 |:------|:---------|:-----------|:--------:|
-| 🌟 **Kimi K2.6** | General default — broad coverage | `kimi-k2.6:cloud` | 1 |
+| 🌟 **Kimi K2.7** | General default — broad coverage | `kimi-k2.7:cloud` | 1 |
 | 🔥 **DeepSeek V4 Pro** | Code, reasoning, math | `deepseek-v4-pro:cloud` | 2 |
 | ✍️ **GLM 5.1** | Creative writing, Chinese, long context | `glm-5.1:cloud` | 3 |
 | 📋 **MiniMax 2.7** | Summarization, dialogue | `minimax-m2.7:cloud` | 4 |
@@ -311,7 +311,7 @@ export OPENAI_API_BASE=http://localhost:8765/v1
 export OPENAI_API_KEY=fleet-local
 
 # 2. Pick any fleet-known model (the openai/ prefix is litellm convention)
-aider --model openai/kimi-k2.6
+aider --model openai/kimi-k2.7
 aider --model openai/deepseek-v4-pro    # max-quality reasoning
 aider --model openai/glm-5.1            # creative / Chinese / long context
 ```
@@ -321,8 +321,8 @@ Or pin it permanently in `~/.aider.conf.yml`:
 ```yaml
 openai-api-base: http://localhost:8765/v1
 openai-api-key:  fleet-local
-model:           openai/kimi-k2.6
-weak-model:      openai/kimi-k2.6
+model:           openai/kimi-k2.7
+weak-model:      openai/kimi-k2.7
 show-model-warnings: false
 ```
 
@@ -519,10 +519,10 @@ ollama:
   api_key: ""                   # set when Ollama requires auth (e.g. cloud models)
 
 models:
-  kimi-k2.6:
+  kimi-k2.7:
     tags: [code, reasoning, math, creative, chinese, long_context, summarize, dialogue, translate, general]
     priority: 1                 # default — wins across every tag
-    api_model: kimi-k2.6
+    api_model: kimi-k2.7
   deepseek-v4-pro:
     tags: [code, reasoning, math]
     priority: 2
