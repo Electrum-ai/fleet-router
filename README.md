@@ -13,7 +13,7 @@
 *Quality-first. Not fastest. Not cheapest. **Best answer.***
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-362%20passing-2ea44f)](#testing)
+[![Tests](https://img.shields.io/badge/tests-472%20passing-2ea44f)](#testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Runtime: Ollama](https://img.shields.io/badge/runtime-Ollama-FF6B35?logo=ollama&logoColor=white)](https://ollama.com)
 [![Quality: Max by default](https://img.shields.io/badge/quality-max%20by%20default-blueviolet)](#quality-by-default)
@@ -68,11 +68,11 @@ A single LLM call is a guess. **Fleet is a system.**
 
 - **3 models × up to 7 samples** (≈21 opinions)
 - **Code execution / numeric vote / LLM judge**
-- **Calibrated abstention**
-- **Thompson-sampling bandit on outcomes**
+- **Calibrated abstention** (per-tag thresholds)
+- **Thompson-sampling bandit on outcomes** (decay + cold-start priors)
 - **Critique → revise** pass (default ON)
 - **Escalation to strongest model** (default ON)
-- **Built-in, with regression gating**
+- **Built-in, with McNemar+bootstrap regression gating**
 - ✅ Local
 - 💰 up to ~25 calls per prompt _(the trade)_
 
@@ -84,7 +84,7 @@ The trade: **per-prompt latency goes 10–30× and cost goes 20–80×, in excha
 
 ### Quality by default
 
-Out of the box, every quality lever is **ON**: parallel ensemble, multi-sample self-consistency, verifier-driven scoring, LLM-as-judge, calibrated abstention, disagreement escalation, critique-and-revise refinement, and bandit learning. The only quality lever that ships **OFF** is `code_execute` — running LLM-generated code is a real RCE vector. Even when you opt in, execution is **hard-gated**: code runs only when you also supply a `code_execute_sandbox` command (firejail/bubblewrap/Docker/etc.) for it to run through. With `code_execute: true` but no sandbox, the verifier logs a warning and falls back to AST-only static scoring — it never runs the code. The AST denylist is an **advisory pre-filter, not a security boundary** (it is trivially bypassable), so the sandbox is the only real isolation.
+Out of the box, every quality lever is **ON**: parallel ensemble, multi-sample self-consistency, verifier-driven scoring, LLM-as-judge (with self-preference and position-bias de-biasing), calibrated abstention (per-tag thresholds), disagreement escalation, critique-and-revise refinement, and bandit learning (with decay and priority-seeded cold start). The only quality lever that ships **OFF** is `code_execute` — running LLM-generated code is a real RCE vector. Even when you opt in, execution is **hard-gated**: code runs only when you also supply a `code_execute_sandbox` command (firejail/bubblewrap/Docker/etc.) for it to run through. With `code_execute: true` but no sandbox, the verifier logs a warning and falls back to AST-only static scoring — it never runs the code. The AST denylist is an **advisory pre-filter, not a security boundary** (it is trivially bypassable), so the sandbox is the only real isolation.
 
 To downshift (faster, cheaper, lower quality), opt out explicitly in `~/.fleet/config.yaml`. See [Configuration](#configuration).
 
@@ -143,7 +143,7 @@ flowchart LR
 |---|---|---|
 | `code` | `CodeVerifier` | AST validity + (opt-in) execution, hard-gated behind a sandbox |
 | `math` | `MathVerifier` | Numeric extraction + cross-sample majority vote |
-| `reasoning`, `creative`, `summarize`, `translate`, `general` | `JudgeVerifier` | LLM-as-judge with tag-specific rubric |
+| `reasoning`, `creative`, `summarize`, `translate`, `general` | `JudgeVerifier` | LLM-as-judge with tag-specific rubric (swap-order de-biased) |
 | any (fallback) | `HeuristicVerifier` | Length / AST / diversity (legacy synthesizer) |
 
 ---
@@ -154,28 +154,36 @@ flowchart LR
 No more "longest" or "lexically diverse" winning. Each tag has an executable or judge-based scorer. Code is AST-validated (and optionally executed, but only through an operator-configured sandbox — see `code_execute_sandbox`). Math runs majority vote over numeric answers. Reasoning/creative/etc. go to an LLM judge with a tag-specific rubric.
 
 ### 🎯 Self-consistency sampling
-Math and reasoning tags sample the same model N times (default 5 / 3) and majority-vote. On GSM8K-class problems this closes most of the gap to frontier models with the same base LLM.
+Math and reasoning tags sample the same model N times (default 7 / 5) and majority-vote. On GSM8K-class problems this closes most of the gap to frontier models with the same base LLM.
 
-### 🛑 Calibrated abstention
-When no candidate clears the quality bar, fleet returns a structured "I don't know — here are the top candidates and why I can't pick" instead of a confident wrong answer.
+### 🛑 Calibrated abstention (per-tag thresholds)
+When no candidate clears the quality bar, fleet returns a structured "I don't know — here are the top candidates and why I can't pick" instead of a confident wrong answer. Per-tag abstention thresholds account for incommensurable score scales across verifiers — fit them from real outcomes with `fleet --eval --calibrate`.
 
 ### ⚖️ Disagreement escalation
-Opt-in: when the verifier abstains or the winner score is weak, fleet hands all candidates to a configured stronger Ollama model for arbitration.
+Opt-in: when the verifier abstains or the winner score is weak, fleet hands all candidates to a configured stronger Ollama model for arbitration. The arbiter is chosen to avoid self-preference bias (a model doesn't judge its own candidates).
 
 ### 🔁 Multi-pass refinement
-Opt-in: critique pass identifies errors, revise pass fixes them. ~5–20pp quality lift on most tasks. Doubles latency.
+Opt-in: critique pass identifies errors, revise pass fixes them. Closed-loop: the revised output is re-verified before acceptance. ~5–20pp quality lift on most tasks. Doubles latency.
 
 ### 📈 Outcome-driven bandit
-Thompson-sampling Beta posteriors per `(tag, model)`. Reward = verifier/judge score (NOT latency). Persists to JSON. Learns which open-source model is actually best for *your* prompt distribution.
+Thompson-sampling Beta posteriors per `(tag, model)`. Reward = verifier/judge score (NOT latency). **Per-round aggregation**: correlated samples from one generation collapse to a single observation, so `samples=5` sharpens the score *estimate* without inflating the bandit's observation count. **Decay** (`bandit.decay`, default 1.0 = no decay) applies exponential forgetting so stale evidence fades. **Cold-start priors** (`bandit.priority_prior_strength`, default 0.5) seed fresh arms with a mild priority-biased prior so the configured ordering dominates zero-evidence starts. Persists atomically to `~/.fleet/bandit.json`.
+
+### 🔀 Judge de-biasing
+Two independent bias guards on the LLM judge:
+- **Self-preference**: when a model is both a candidate and the judge, a neutral arbiter is substituted automatically.
+- **Position bias**: the judge runs twice (original + reversed candidate order) and per-candidate scores are averaged to cancel ordering effects.
 
 ### 🧠 Thinking-model aware
-`<thinking>...</thinking>` chain-of-thought blocks are stripped before scoring AND before returning, so reasoning models aren't penalized for verbose internal reasoning and users only see the final answer.
+`<thinking>...</thinking>` chain-of-thought blocks are stripped at the candidate boundary (before scoring) AND before returning, so reasoning models aren't penalized for verbose internal reasoning and users only see the final answer. Stripping is centralized in `fleet/text.py` — applied once in the synthesizer, again at every consumer boundary (router return, escalation, refinement). Per-class timeout budgets ensure reasoning models get their full generation window instead of being cut off at the chat timeout.
 
 ### 🧪 Eval harness with regression gating
-JSONL fixtures + per-tag scorers + multi-choice + comparison harness. `fleet --eval --baseline path.json` exits non-zero on >3pp regression — wire it into CI.
+JSONL fixtures + per-tag scorers + multi-choice + comparison harness. Regression gating uses **McNemar exact test** (paired proportions) + **percentile bootstrap confidence intervals** — not ad-hoc "3pp swing" thresholds. Small-n abstention guards prevent statistical conclusions on sparse data. `fleet --eval --baseline path.json` exits non-zero on statistically significant regression — wire it into CI.
 
 ### 📡 Live progress
 Default-on stderr ticker so you see `→ classified as 'creative' (0.42)` / `→ dispatching 3 models × 5 samples` / `→ synthesized [verifier]: winner=glm-5.1 (0.78)` instead of staring at a black 60–180s pause. `--quiet` suppresses.
+
+### 📝 Config-backed system prompt
+A `system_prompt` field in `config.yaml` lets you set a default system prompt injected into every request (unless the caller provides one). The bundled config ships the **agent-research-patterns** skill — best practices for web research, source quality, copyright compliance, file creation decisions, and tool routing. Override it or set it to empty in your own `~/.fleet/config.yaml`.
 
 ---
 
@@ -258,7 +266,7 @@ The proxy resolves the request's `model` field against the fleet registry and **
 
 ### Auto-start hook for Claude Code
 
-Inside the fleet-router project, `.claude/settings.json` registers a SessionStart hook that runs `scripts/fleet-ensure-proxy.py` — an idempotent, flock-guarded boot that starts the proxy if it's not up and polls `/healthz`. Open a chat in `~/fleet-router` and the proxy is ready before your first message.
+Inside the fleet-router project, `.claude/settings.json` registers a SessionStart hook that runs `scripts/fleet-ensure-proxy.py` — an idempotent, flock-guarded boot that starts the proxy if it's not up and polls `/healthz`. Runtime state lives in a private `~/.fleet/run/` directory (mode 0700, O_NOFOLLOW on pidfile/logfile). Open a chat in `~/fleet-router` and the proxy is ready before your first message.
 
 ### Toggle script
 
@@ -277,7 +285,7 @@ fleet-off     # stop proxy + unset env vars; claude goes back to Anthropic
 ```
 
 > [!WARNING]
-> The proxy binds to `127.0.0.1` by default (local only). If you set `--host 0.0.0.0`, **always** also set `--api-key` to prevent open access to your Ollama compute. Auth accepts `x-api-key` (Anthropic style) or `Authorization: Bearer <key>` (OpenAI style) — both are constant-time compared.
+> The proxy binds to `127.0.0.1` by default (local only). If you set `--host 0.0.0.0`, **always** also set `--api-key` to prevent open access to your Ollama compute. Auth accepts `x-api-key` (Anthropic style) or `Authorization: Bearer ***` (OpenAI style) — both are constant-time compared. Host-header allowlisting prevents DNS-rebinding attacks on non-loopback binds.
 
 ---
 
@@ -296,6 +304,9 @@ fleet --eval evals/fixtures/                                # run all fixtures
 fleet --eval evals/fixtures/hard/                           # discriminating set
 fleet --eval evals/fixtures/hard/ --save-baseline base.json # snapshot
 fleet --eval evals/fixtures/hard/ --baseline base.json      # regression gate
+
+# Calibrate per-tag abstention thresholds from eval outcomes
+fleet --eval evals/fixtures/ --calibrate thresholds.yaml
 
 # Serve as HTTP proxy
 fleet --serve --port 8765 --api-key fleet-local             # bind 127.0.0.1:8765
@@ -352,6 +363,13 @@ synthesis:
   mode: verifier
   judge_model: deepseek-v4-pro  # strongest model arbitrates judge-based tags
   abstention_threshold: 0.4
+  # Per-tag overrides — verifier score scales are incommensurable,
+  # so one global 0.4 can't be calibrated for all tags. Fit from real
+  # outcomes with: fleet --eval --calibrate thresholds.yaml
+  # abstention_thresholds:
+  #   math: 0.6
+  #   code: 0.55
+  judge_swap_order: true        # de-bias position bias (2 judge passes, averaged)
   code_execute: false           # OFF for security — running LLM code is an RCE vector
   code_execute_timeout: 5
   # Sandbox command TEMPLATE. Execution happens ONLY when code_execute is true
@@ -380,6 +398,15 @@ escalation:
 bandit:
   enabled: true                 # outcome-driven Thompson sampling
   state_path: ~/.fleet/bandit.json   # persists posteriors across runs
+  decay: 1.0                   # (0,1] — <1.0 applies exponential forgetting
+  priority_prior_strength: 0.5 # cold-start: seeds fresh arms with priority-biased prior
+
+# Default system prompt — injected when the caller doesn't provide one.
+# Empty string = no system prompt. The bundled config ships the
+# agent-research-patterns skill (search behavior, source quality,
+# copyright compliance, file creation, tool routing).
+system_prompt: |
+  You are a research agent. Follow these patterns ...
 ```
 
 ### Downshift recipe (faster, cheaper, less quality)
@@ -396,6 +423,7 @@ synthesis:
 refinement:   { enabled: false }
 escalation:   { enabled: false }
 bandit:       { enabled: false }
+system_prompt: ""               # clear the default system prompt
 ```
 
 ### Cloud-models recipe
@@ -408,7 +436,7 @@ ollama:
   api_key: "<your-key>"
 ```
 
-The provider sends `Authorization: Bearer <api_key>` plus `Accept: application/json` — required by Ollama Cloud or it returns `{"error":"unauthorized"}`.
+The provider sends `Authorization: Bearer <key>` plus `Accept: application/json` — required by Ollama Cloud or it returns `{"error":"unauthorized"}`.
 
 ### Full schema
 
@@ -442,6 +470,10 @@ retrieval:
   tags: []                      # tags to augment, e.g. [reasoning, general]
   provider: noop                # "noop" or "websearch" (needs SERP_API_KEY)
   max_chars: 4000
+
+# Default system prompt injected into every request (unless overridden).
+# Empty string = no system prompt.
+system_prompt: ""               # or a multi-line prompt via | YAML block scalar
 ```
 
 ---
@@ -450,7 +482,7 @@ retrieval:
 
 ### Classification
 
-Keyword regex with **saturating exponential** scoring (1 match → 0.55, 2 → 0.80, 3+ → 0.91). Single accidental matches stay below the parallel-mode threshold. Optional sentence-transformer embedding adds a bounded bonus to the dominant tag. Optional `LLMClassifier` for harder cases.
+Keyword regex with **saturating exponential** scoring (1 match → 0.55, 2 → 0.80, 3+ → 0.91). Single accidental matches stay below the parallel-mode threshold. Optional sentence-transformer embedding adds a bounded bonus to the dominant tag. Optional `LLMClassifier` for harder cases (opt-in via `classifier.mode: llm`).
 
 ### Routing Decision
 
@@ -463,11 +495,11 @@ Keyword regex with **saturating exponential** scoring (1 match → 0.55, 2 → 0
 
 ### Verification
 
-Per-tag verifiers replace heuristics. `CodeVerifier` AST-walks for dangerous patterns (subprocess, eval, file I/O, network) as an **advisory pre-filter** and refuses to even hand obviously-dangerous code to the sandbox. This denylist is **not** a security boundary (it is trivially bypassable via `getattr`/`__subclasses__`), so execution is hard-gated: candidate code runs only when `code_execute=true` **and** a `code_execute_sandbox` command template is configured, and then only *through* that sandbox. With no sandbox, the verifier warns and scores by AST alone. `MathVerifier` extracts final numeric answers (handling `\boxed{}`, "answer is X", scientific notation, decimals) and majority-votes. `JudgeVerifier` sends labeled candidates to an Ollama judge with a tag-specific rubric and parses ranked output (with JSON-extraction fallback for verbose models).
+Per-tag verifiers replace heuristics. `CodeVerifier` AST-walks for dangerous patterns (subprocess, eval, file I/O, network) as an **advisory pre-filter** and refuses to even hand obviously-dangerous code to the sandbox. This denylist is **not** a security boundary (it is trivially bypassable via `getattr`/`__subclasses__`), so execution is hard-gated: candidate code runs only when `code_execute=true` **and** a `code_execute_sandbox` command template is configured, and then only *through* that sandbox. With no sandbox, the verifier warns and scores by AST alone. `MathVerifier` extracts final numeric answers (handling `\boxed{}`, "answer is X", scientific notation, decimals) and majority-votes. `JudgeVerifier` sends labeled candidates to an Ollama judge with a tag-specific rubric, runs twice (original + reversed order) to cancel position bias, and parses ranked output (with JSON-extraction fallback for verbose models). Self-preference is guarded: a model never judges its own candidates.
 
 ### Calibrated Abstention
 
-When the winner's score is below `abstention_threshold` OR the verifier flags abstention, fleet returns:
+When the winner's score is below `abstention_threshold` (or a per-tag override in `abstention_thresholds`) OR the verifier flags abstention, fleet returns:
 
 ```
 (uncertain — <reason>)
@@ -481,7 +513,7 @@ Top candidates considered:
 <answer>
 ```
 
-Beats a confident wrong answer.
+Beats a confident wrong answer. Per-tag thresholds account for incommensurable score scales across verifiers — fit them from real eval outcomes with `fleet --eval --calibrate`.
 
 ### Outcome-Driven Bandit
 
@@ -508,19 +540,27 @@ Built-in scorers:
 | `MultipleChoiceScorer` | 1.0 if extracted A/B/C/D/E matches | reasoning (MMLU-style) |
 | `KeywordContainsScorer` | fraction of expected keywords present | summarize, creative, general |
 
+### Regression gating
+
+`--baseline` mode compares a candidate run against a saved baseline using **McNemar exact test** for paired proportions (same fixtures, paired outcomes). A prompt that passes under the candidate but failed under the baseline (or vice versa) is a *discordant pair* — McNemar tests whether the imbalance is statistically significant. The comparison harness also computes **percentile bootstrap confidence intervals** on per-tag accuracy deltas. A small-n guard abstains from statistical claims when a tag has fewer than 10 observations. Exit code `3` signals regression; `0` signals no significant decline.
+
+### Calibration
+
+`--calibrate` fits per-tag abstention thresholds from observed eval outcomes. For each tag, it sweeps candidate thresholds over winner scores and picks the lowest threshold that delivers a target selective accuracy at maximum coverage. Output is a config-ready `abstention_thresholds` block that drops straight into your config.
+
 ---
 
 ## Testing
 
 ```bash
-pytest tests/                # 362 passing (1 skips without sentence-transformers)
+pytest tests/                # 472 passing (1 skips without sentence-transformers)
 pytest tests/verifiers/      # verifier framework
-pytest tests/evals/          # harness + scorers
+pytest tests/evals/          # harness + scorers + calibration + stats
 pytest tests/test_proxy.py   # Anthropic + OpenAI proxy compatibility
 pytest tests/test_cli.py     # CLI: ask / eval / serve / quiet
 ```
 
-362 tests across 31 files cover providers (including session reuse + concurrency-cap + per-class timeout-budget guards), verifiers (code/math/judge/heuristic, including the thinking-strip and code-execution hard-gate), self-consistency, escalation, refinement (with closed-loop output verification), abstention (including self-judge bias guards), bandit (selection + posterior updates + persistence), event bus + progress sink, LLM classifier (and its router wiring), retrieval (and its router wiring), eval harness + comparison harness, CLI (including eval + serve subcommands, the non-loopback-bind guard, and aclose lifecycle), Anthropic + OpenAI proxy compatibility (parsing, streaming heartbeat/deadline, force-model resolver, auth, Host-allowlist, error redaction, body validation, ollama-down enrichment, concurrent requests), the ensure-proxy hardening (run-dir perms, O_NOFOLLOW, kill verification), max-quality default policy, and config validation.
+472 tests across 34 files cover providers (including session reuse + concurrency-cap + per-class timeout-budget guards), verifiers (code/math/judge/heuristic, including the thinking-strip and code-execution hard-gate), self-consistency, escalation, refinement (with closed-loop output verification), abstention (including self-judge bias guards, per-tag thresholds), bandit (selection + per-round posterior updates + persistence + decay + cold-start priors), judge de-biasing (self-preference + swap-order position bias), event bus + progress sink, LLM classifier (and its router wiring), retrieval (and its router wiring), config-backed default system prompt, eval harness + comparison harness + calibration + statistically sound regression gating (McNemar, bootstrap CI), CLI (including eval + serve + calibrate subcommands, the non-loopback-bind guard, and aclose lifecycle), Anthropic + OpenAI proxy compatibility (parsing, streaming heartbeat/deadline, force-model resolver, auth, Host-allowlist, error redaction, body validation, ollama-down enrichment, concurrent requests), the ensure-proxy hardening (run-dir perms, O_NOFOLLOW, kill verification), max-quality default policy, and config validation.
 
 ---
 
@@ -534,6 +574,11 @@ pytest tests/test_cli.py     # CLI: ask / eval / serve / quiet
 | ✅ Shipped | Thinking-model safety: centralized chain-of-thought stripping at the candidate boundary, per-class generation timeout budgets (reasoning models aren't cut off at the chat timeout), closed-loop verification of refinement/escalation outputs |
 | ✅ Shipped | Security hardening: non-loopback-bind API-key requirement, Host-header allowlist, error redaction, request-body validation, private 0700 runtime dir with O_NOFOLLOW, code-execution hard-gate behind an operator-supplied sandbox |
 | ✅ Shipped | LLM classifier and retrieval wired into the router (opt-in via `classifier.mode: llm` / `retrieval.enabled`) |
+| ✅ Shipped | Judge de-biasing: self-preference guard (neutral arbiter substitution) + position-bias guard (swap-order averaging) |
+| ✅ Shipped | Per-tag abstention thresholds + calibration from eval outcomes |
+| ✅ Shipped | Bandit hygiene: per-round aggregation, exponential decay, priority-seeded cold-start priors |
+| ✅ Shipped | Statistically sound regression gating (McNemar exact test + percentile bootstrap CI) |
+| ✅ Shipped | Config-backed default system prompt (agent-research-patterns) |
 | 🛠 Next | Class-aware streaming with thinking-model-safe cancellation |
 | 💭 Considering | LLM classifier as default, retrieval for `general` tag by default, Strategy plugin registry via entry points, real tool-call translation in proxy |
 
@@ -553,6 +598,7 @@ fleet-router/
 │   ├── synthesizer.py         # legacy heuristic picker
 │   ├── bandit.py              # Thompson sampling + persistence
 │   ├── events.py              # typed event bus + sinks (incl. cli_progress_sink)
+│   ├── text.py                # centralized thinking-strip + text utilities
 │   ├── retrieval.py           # NoOp + WebSearch (SerpAPI-shape)
 │   ├── proxy.py               # Anthropic + OpenAI HTTP proxy
 │   ├── providers/             # Provider Protocol + Ollama
@@ -560,12 +606,14 @@ fleet-router/
 ├── evals/
 │   ├── runner.py              # load → score → aggregate → compare
 │   ├── compare.py             # side-by-side router comparison
+│   ├── calibrate.py           # fit per-tag abstention thresholds from evals
+│   ├── stats.py               # McNemar test, bootstrap CI, small-n guards
 │   ├── scorers/               # code-exec, numeric, multi-choice, keyword
 │   └── fixtures/              # easy + hard JSONL sets
 ├── scripts/
 │   ├── fleet-toggle.sh        # shell-scoped opt-in for Claude Code backend
 │   └── fleet-ensure-proxy.py  # idempotent flock-guarded auto-boot
-└── tests/                     # 362 tests across 31 files
+└── tests/                     # 472 tests across 34 files
 ```
 
 ---
