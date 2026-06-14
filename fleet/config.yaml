@@ -40,10 +40,26 @@ synthesis:
   # Strongest model arbitrates judge-based tags (reasoning, creative, …).
   judge_model: deepseek-v4-pro
   abstention_threshold: 0.4
-  # OFF for security: running LLM-generated code is a real RCE vector
-  # even with static safety checks. Opt in only if you trust the sandbox.
+  # Per-tag overrides for the abstention cut-point. Verifier score scales are
+  # INCOMMENSURABLE across tags (judge x/10 → [0,1], math agreement fractions,
+  # code static band), so one global 0.4 can't be calibrated for all. Tags
+  # listed here use their own threshold; everything else falls back to
+  # abstention_threshold above. Empty (default) ⇒ historical single-threshold
+  # behavior. Fit these from real outcomes with:
+  #   fleet --eval evals/fixtures --repeats 5 --calibrate thresholds.yaml
+  # abstention_thresholds:
+  #   math: 0.6
+  #   code: 0.55
+  # OFF for security: running LLM-generated code is a real RCE vector.
   code_execute: false
   code_execute_timeout: 5
+  # Sandbox command TEMPLATE. Execution happens ONLY when code_execute is true
+  # AND this is non-empty; code then runs THROUGH this command, never raw.
+  # {python}/{file}/{dir} are substituted at run time. Empty (default) means
+  # code is NEVER executed (AST-only scoring). The AST denylist is an advisory
+  # pre-filter, NOT a sandbox boundary.
+  # Example: "firejail --net=none --private={dir} {python} {file}"
+  code_execute_sandbox: ""
 
 sampling:
   samples_by_tag:
@@ -71,3 +87,58 @@ retrieval:
 bandit:
   enabled: true
   state_path: ~/.fleet/bandit.json
+  # Exponential forgetting in (0, 1]. 1.0 = no decay (posteriors accumulate
+  # forever). <1.0 shrinks the learned excess over the prior toward the prior
+  # before each new observation, so a model that silently changed under the
+  # same tag recovers faster.
+  decay: 1.0
+  # Cold-start priority seeding. 0.0 = uniform Beta(1,1) for every fresh arm.
+  # >0.0 seeds an unseen arm with a mild priority-biased prior
+  # (alpha = 1 + strength/priority, beta = 1) so the cold start respects the
+  # configured priority order. A few real observations quickly wash it out.
+  priority_prior_strength: 0.5
+
+# Default system prompt injected into every request (unless the caller
+# provides one). Empty string = no system prompt. This is the
+# agent-research-patterns skill — best practices for web research, source
+# quality, copyright compliance, file creation, and tool routing.
+system_prompt: |
+  You are a research agent. Follow these patterns when doing web research or content creation:
+
+  Search behavior:
+  - Timeless knowledge → answer directly. Current roles/events/products → always search. Never guess unrecognized entities.
+  - Scale tool calls to complexity: single fact = 1 call, medium = 3-5, deep = 5-10+.
+  - Keep queries 1-6 words. Start broad, narrow if needed. Never repeat similar queries.
+  - Use current date for time-sensitive queries.
+
+  Source quality:
+  1. Original sources (company blogs, papers, gov sites, SEC filings)
+  2. Reputable secondary (established news, analysts)
+  3. Aggregators (Wikipedia — starting point only)
+  4. Forums/community (only when specifically relevant)
+
+  Copyright compliance:
+  - Max 15 words per direct quote. One quote per source, then source is closed.
+  - Never reproduce song lyrics, poems, or haikus — even one line.
+  - Never reproduce article paragraphs verbatim.
+  - Paraphrase by default — completely rewrite in your own words.
+  - Never reconstruct article structure or section headers.
+  - Paraphrased content per source: 2-3 sentences max.
+
+  File creation:
+  - Blog/article/story/social post → file (.md/.html)
+  - Code >20 lines → file
+  - Strategy/summary/outline/brainstorm → inline
+  - Code ≤20 lines → inline
+  - When in doubt: "will the user copy/paste this elsewhere?" If yes → file.
+
+  Tool routing:
+  - User names a connector → use directly.
+  - User describes a need → search registry, suggest options, user chooses.
+  - Never pick a provider for the user.
+
+  Pitfalls:
+  - Confabulation: unrecognized entity → always search.
+  - Quote creep: one per source, under 15 words.
+  - Displacive summaries: rewrite completely or keep to 2-3 sentences.
+  - Over-searching: "how does TCP work" doesn't need a search. "latest TCP RFC" does.

@@ -51,8 +51,22 @@ class ThresholdConfig:
     # ensemble + verifier-driven synthesis). Set to 0.8 to opt back into
     # the speed-vs-quality split at the classifier.
     single_confidence: float = 1.01
+    # Legacy session-wide budget. Retained as a backward-compatible source
+    # for `timeouts` when a config predates the per-class field.
     parallel_timeout: int = 60
     max_parallel: int = 3
+    # Per-model-class wall-clock budget (seconds) for one generation. A
+    # reasoning model (deepseek-v4-pro) routinely thinks for minutes; cutting
+    # it off at the chat budget returns None and degrades the round to its
+    # fast-chat survivors — and with a one-model reasoning pool, to
+    # "(all models failed)". The dispatcher resolves a model's class and
+    # applies its budget as a PER-REQUEST aiohttp ClientTimeout, which fully
+    # replaces (not caps) the provider's session default. The shared session
+    # is therefore sized to the chat budget; the reasoning class still gets
+    # its full per-request budget.
+    timeouts: dict[str, int] = field(
+        default_factory=lambda: {"chat": 60, "reasoning": 240}
+    )
 
 
 @dataclass
@@ -73,11 +87,31 @@ class SynthesisConfig:
     # JudgeVerifier not registered, falls through to HeuristicVerifier.
     judge_model: str = ""
     # Verifier-set winner.score below this triggers calibrated abstention.
+    # This is the DEFAULT/fallback applied to any tag without a per-tag
+    # override below.
     abstention_threshold: float = 0.4
+    # Per-tag abstention threshold overrides. Score scales are INCOMMENSURABLE
+    # across verifiers (judge x/10 → [0,1], math agreement fractions, code
+    # static-band scores), so one global 0.4 can't be calibrated for all tags.
+    # A tag listed here uses its own threshold; everything else falls back to
+    # `abstention_threshold`. Empty (default) ⇒ every tag uses 0.4, exactly the
+    # historical behavior. Populate it from `evals.calibrate` fitted outcomes.
+    abstention_thresholds: dict[str, float] = field(default_factory=dict)
+    # Swap-order consistency for the LLM judge: run the judge twice (given
+    # order + reversed) and average per-candidate scores to cancel position
+    # bias. ON by default (quality-first); OFF reverts to a single pass.
+    judge_swap_order: bool = True
     # CodeVerifier only: opt into running candidate code in a subprocess.
     # OFF by default — running LLM-generated code is a real RCE vector.
     code_execute: bool = False
     code_execute_timeout: int = 5
+    # Operator-supplied sandbox command TEMPLATE used to run candidate code.
+    # Execution happens ONLY when code_execute is True AND this is non-empty.
+    # Placeholders {python}/{file}/{dir} are substituted at run time, e.g.
+    # "firejail --net=none --private={dir} {python} {file}". Empty (default)
+    # means code is NEVER executed — the AST denylist is an advisory filter,
+    # not a sandbox, so CodeVerifier falls back to AST-only static scoring.
+    code_execute_sandbox: str = ""
 
 
 @dataclass
@@ -141,6 +175,18 @@ class BanditConfig:
     enabled: bool = True
     # Where to persist Beta posteriors. Empty = in-memory only.
     state_path: str = ""
+    # Exponential forgetting in (0, 1]. 1.0 = no decay (learned posteriors
+    # accumulate forever, exact historical behavior). <1.0 shrinks the
+    # learned excess over the prior toward the prior before each new
+    # observation, so a model that was good then silently changed under the
+    # same tag (Ollama cloud upgrades) recovers faster.
+    decay: float = 1.0
+    # Cold-start priority seeding strength. 0.0 = uniform Beta(1,1) for every
+    # fresh arm (random-shuffle cold start). >0.0 seeds an unseen arm with a
+    # mild priority-biased prior (alpha = 1 + strength/priority, beta = 1) so
+    # the human priority ordering dominates the zero-evidence cold start; a
+    # few real observations quickly wash it out. Default 0.5 = mild.
+    priority_prior_strength: float = 0.5
 
 
 @dataclass
@@ -155,6 +201,9 @@ class Config:
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     bandit: BanditConfig = field(default_factory=BanditConfig)
+    # Default system prompt injected into every request unless the caller
+    # overrides it. Empty string = no system prompt (backward compat).
+    system_prompt: str = ""
 
 
 def clean_model_key(key: str) -> str:
@@ -208,6 +257,27 @@ def _coerce_float(raw: Any, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _coerce_threshold_map(raw: Any) -> dict[str, float]:
+    """Coerce a per-tag abstention-threshold mapping. Keys must be strings,
+    values must parse to a float and are clamped to [0, 1]. Junk keys (non-str)
+    and junk values (non-numeric / NaN) are dropped silently — a misconfigured
+    entry must never widen or disable abstention for a tag by accident."""
+    out: dict[str, float] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f != f:  # NaN
+            continue
+        out[k] = min(1.0, max(0.0, f))
+    return out
 
 
 def load_config(path: Path | str | None = None) -> Config:
@@ -277,10 +347,32 @@ def load_config(path: Path | str | None = None) -> Config:
     thresh_raw = raw.get("thresholds", {})
     if not isinstance(thresh_raw, dict):
         thresh_raw = {}
+    parallel_timeout = _coerce_int(thresh_raw.get("parallel_timeout"), 60)
+    timeouts_raw = thresh_raw.get("timeouts")
+    if isinstance(timeouts_raw, dict):
+        # Explicit per-class budgets. Seed from the ThresholdConfig dataclass
+        # default (not a duplicated literal — so the two can't drift) so a
+        # partial mapping (e.g. {"reasoning": 300}) keeps chat at its default,
+        # then overlay coerced ints. Junk values are ignored (default kept).
+        timeouts = dict(ThresholdConfig().timeouts)
+        for k, v in timeouts_raw.items():
+            try:
+                timeouts[str(k)] = max(1, int(v))
+            except (TypeError, ValueError):
+                continue
+    else:
+        # Backward-compat: no `timeouts` block. Derive from parallel_timeout so
+        # existing configs don't suddenly cut reasoning models off at the chat
+        # budget — reasoning gets at least 240s.
+        timeouts = {
+            "chat": parallel_timeout,
+            "reasoning": max(parallel_timeout, 240),
+        }
     thresholds = ThresholdConfig(
         single_confidence=_coerce_float(thresh_raw.get("single_confidence"), 1.01),
-        parallel_timeout=_coerce_int(thresh_raw.get("parallel_timeout"), 60),
+        parallel_timeout=parallel_timeout,
         max_parallel=_coerce_int(thresh_raw.get("max_parallel"), 3),
+        timeouts=timeouts,
     )
 
     clf_raw = raw.get("classifier", {})
@@ -306,8 +398,11 @@ def load_config(path: Path | str | None = None) -> Config:
         mode=syn_mode,
         judge_model=str(syn_raw.get("judge_model", "")),
         abstention_threshold=_coerce_float(syn_raw.get("abstention_threshold"), 0.4),
+        abstention_thresholds=_coerce_threshold_map(syn_raw.get("abstention_thresholds")),
+        judge_swap_order=bool(syn_raw.get("judge_swap_order", True)),
         code_execute=bool(syn_raw.get("code_execute", False)),
         code_execute_timeout=_coerce_int(syn_raw.get("code_execute_timeout"), 5),
+        code_execute_sandbox=str(syn_raw.get("code_execute_sandbox", "") or ""),
     )
 
     samp_raw = raw.get("sampling", {}) if isinstance(raw.get("sampling"), dict) else {}
@@ -347,9 +442,18 @@ def load_config(path: Path | str | None = None) -> Config:
     )
 
     bandit_raw = raw.get("bandit", {}) if isinstance(raw.get("bandit"), dict) else {}
+    # Decay clamps to (0, 1]; anything outside (junk, 0, negatives, >1) falls
+    # back to 1.0 = no decay, the safe historical default.
+    decay = _coerce_float(bandit_raw.get("decay"), 1.0)
+    if not (0.0 < decay <= 1.0):
+        decay = 1.0
+    # Seeding strength clamps to >= 0.0 (0.0 disables seeding).
+    strength = max(0.0, _coerce_float(bandit_raw.get("priority_prior_strength"), 0.5))
     bandit = BanditConfig(
         enabled=bool(bandit_raw.get("enabled", True)),
         state_path=str(bandit_raw.get("state_path", "")),
+        decay=decay,
+        priority_prior_strength=strength,
     )
 
     return Config(
@@ -363,4 +467,5 @@ def load_config(path: Path | str | None = None) -> Config:
         escalation=escalation,
         retrieval=retrieval,
         bandit=bandit,
+        system_prompt=str(raw.get("system_prompt", "") or "") if isinstance(raw.get("system_prompt"), str) else "",
     )

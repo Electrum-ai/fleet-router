@@ -16,6 +16,11 @@ class GenerateRequest:
     temperature: float = 0.7
     max_tokens: Optional[int] = None
     samples: int = 1
+    # Per-request wall-clock budget (seconds). When set, overrides the
+    # provider's session-wide default so a slow reasoning model gets its
+    # larger class budget instead of being cut off at the chat budget.
+    # None = fall back to the session default.
+    timeout: Optional[float] = None
 
 
 @dataclass(frozen=True)

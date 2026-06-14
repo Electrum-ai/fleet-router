@@ -6,6 +6,8 @@ import difflib
 import re
 from typing import Optional
 
+from fleet.text import strip_thinking
+
 # Cap inputs to expensive operations. ast.parse on multi-MB strings can
 # trigger pathological recursion; difflib.SequenceMatcher is O(n²).
 _MAX_AST_PARSE_CHARS = 200_000
@@ -17,18 +19,7 @@ _FENCE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
-# Reasoning models (DeepSeek-R1, QwQ, o1-style, deepseek-v4-pro reasoning mode)
-# emit a chain-of-thought wrapped in <think>...</think>. Stripping it before
-# scoring prevents the synthesizer from rewarding "longest" purely because a
-# model dumped 5KB of internal reasoning into the response field.
-_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
-
 ERROR_ALL_MODELS_FAILED = "(all models failed)"
-
-
-def _strip_thinking(text: str) -> str:
-    """Remove <think>...</think> chain-of-thought blocks."""
-    return _THINK_RE.sub("", text).strip()
 
 
 def _extract_code(text: str) -> str:
@@ -59,7 +50,7 @@ class Synthesizer:
         for k, v in responses.items():
             if not v:
                 continue
-            cleaned = _strip_thinking(v)
+            cleaned = strip_thinking(v)
             if cleaned:
                 valid[k] = cleaned
         if not valid:

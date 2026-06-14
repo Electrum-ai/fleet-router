@@ -12,11 +12,15 @@
 # runs in the background and is shared across shells.
 
 export FLEET_PORT="${FLEET_PORT:-8765}"
-export FLEET_PIDFILE="${FLEET_PIDFILE:-${TMPDIR:-/tmp}/fleet-proxy.pid}"
-export FLEET_LOGFILE="${FLEET_LOGFILE:-${TMPDIR:-/tmp}/fleet-proxy.log}"
+# Runtime state lives in a PRIVATE 0700 dir, not world-writable $TMPDIR.
+export FLEET_RUN_DIR="${FLEET_RUN_DIR:-$HOME/.fleet/run}"
+export FLEET_PIDFILE="${FLEET_PIDFILE:-$FLEET_RUN_DIR/fleet-proxy.pid}"
+export FLEET_LOGFILE="${FLEET_LOGFILE:-$FLEET_RUN_DIR/fleet-proxy.log}"
 export FLEET_API_KEY="${FLEET_API_KEY:-fleet-local}"
 
 fleet-on() {
+  # Ensure the private runtime dir exists with tight perms before writing.
+  mkdir -p "$FLEET_RUN_DIR" && chmod 700 "$FLEET_RUN_DIR"
   if [ -f "$FLEET_PIDFILE" ] && kill -0 "$(cat "$FLEET_PIDFILE")" 2>/dev/null; then
     echo "fleet-proxy already running (pid $(cat "$FLEET_PIDFILE"), port $FLEET_PORT)"
   else

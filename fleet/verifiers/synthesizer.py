@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from fleet.text import strip_thinking
 from fleet.verifiers.base import (
     DEFAULT_ABSTENTION_THRESHOLD,
     Candidate,
@@ -24,9 +25,33 @@ class VerifierSynthesizer:
         self,
         registry: Optional[VerifierRegistry] = None,
         abstention_threshold: float = DEFAULT_ABSTENTION_THRESHOLD,
+        abstention_thresholds: Optional[dict[str, float]] = None,
     ):
         self._registry = registry or VerifierRegistry()
+        # Global fallback threshold + incommensurable-scale per-tag overrides.
+        # Verifier score scales differ by tag (judge x/10 → [0,1], math
+        # agreement fractions, code static band), so one global cut-point can't
+        # be calibrated for all of them. A tag absent from the override map
+        # falls back to `abstention_threshold` — so an empty map reproduces the
+        # exact historical single-threshold behavior.
         self._abstention_threshold = abstention_threshold
+        self._abstention_thresholds = dict(abstention_thresholds or {})
+
+    def abstention_threshold_for(self, task_tag: Optional[str]) -> float:
+        """The abstention cut-point that applies to `task_tag`: its per-tag
+        override if configured, else the global default. Exposed so the router
+        can make tag-aware escalation decisions on the same threshold the
+        synthesizer would have used."""
+        if task_tag is None:
+            return self._abstention_threshold
+        return self._abstention_thresholds.get(task_tag, self._abstention_threshold)
+
+    def verifier_for(self, task_tag: str):
+        """Resolve the Verifier that will score `task_tag` (post-fallback).
+        Exposed so the router can tell a discriminative verifier (judge /
+        executable / math) from the order-dependent HeuristicVerifier when
+        gating refinement accepts."""
+        return self._registry.for_tag(task_tag)
 
     async def pick(
         self,
@@ -37,8 +62,22 @@ class VerifierSynthesizer:
         candidates: list[Candidate] = []
         for model, samples in samples_per_model.items():
             for i, text in enumerate(samples):
-                if text and text.strip():
-                    candidates.append(Candidate(model=model, sample_idx=i, text=text))
+                if not text or not text.strip():
+                    continue
+                # Strip chain-of-thought exactly ONCE, here at the candidate
+                # boundary, so scoring, judge/escalation prompts, abstention
+                # summaries, refinement input, and the returned winner are all
+                # consistently clean. Keep the original in raw_text. A sample
+                # that is *only* a <think> block collapses to "" and is
+                # dropped — it never masqueraded as a real answer.
+                cleaned = strip_thinking(text)
+                if not cleaned:
+                    continue
+                candidates.append(
+                    Candidate(
+                        model=model, sample_idx=i, text=cleaned, raw_text=text
+                    )
+                )
 
         if not candidates:
             return VerificationResult(
@@ -49,9 +88,39 @@ class VerifierSynthesizer:
         verifier = self._registry.for_tag(task_tag)
         result = await verifier.aggregate(prompt, candidates)
 
+        return self._apply_abstention(result, task_tag)
+
+    async def score_candidates(
+        self,
+        prompt: str,
+        candidates: list[Candidate],
+        task_tag: str,
+    ) -> VerificationResult:
+        """Score an explicit, already-clean list of Candidates with the tag
+        verifier — no sample flattening, no chain-of-thought stripping, and no
+        calibrated-abstention overlay. Used by the router to close the loop on
+        refinement/escalation outputs: it returns the raw verifier scores
+        (winner + all_scored) so the caller can compare an ad-hoc rewrite
+        against the originals under the SAME verifier the round used.
+
+        Callers are responsible for passing strip_thinking()'d text.
+        """
+        if not candidates:
+            return VerificationResult(
+                winner=None, all_scored=[],
+                rationale="no candidates", abstain=True,
+            )
+        verifier = self._registry.for_tag(task_tag)
+        return await verifier.aggregate(prompt, candidates)
+
+    def _apply_abstention(
+        self, result: VerificationResult, task_tag: Optional[str] = None
+    ) -> VerificationResult:
         # Calibrated abstention: even if verifier picked a winner, abstain
-        # when the winner's score is below threshold. Verifier-set
-        # `abstain=True` always wins (verifier knows best).
+        # when the winner's score is below the threshold that applies to this
+        # tag. Verifier-set `abstain=True` always wins (verifier knows best).
+        # `task_tag=None` (e.g. direct unit-test calls) uses the global default.
+        threshold = self.abstention_threshold_for(task_tag)
         if result.abstain:
             return result
         if result.winner is None:
@@ -59,14 +128,19 @@ class VerifierSynthesizer:
                 winner=None, all_scored=result.all_scored,
                 rationale=result.rationale or "verifier returned no winner",
                 abstain=True,
+                # Preserve reliability — an unreliable result must stay
+                # unreliable through the rebuild so the bandit (which runs
+                # even on abstain) never ingests judge-failure noise.
+                scores_reliable=result.scores_reliable,
             )
-        if result.winner.score < self._abstention_threshold:
+        if result.winner.score < threshold:
             return VerificationResult(
                 winner=None, all_scored=result.all_scored,
                 rationale=(
                     f"winner score {result.winner.score:.2f} below threshold "
-                    f"{self._abstention_threshold}; abstaining"
+                    f"{threshold}; abstaining"
                 ),
                 abstain=True,
+                scores_reliable=result.scores_reliable,
             )
         return result

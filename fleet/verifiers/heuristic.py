@@ -3,6 +3,7 @@ for when no judge / executable verifier is available."""
 from __future__ import annotations
 
 from fleet.synthesizer import Synthesizer
+from fleet.text import strip_thinking
 from fleet.verifiers.base import Candidate, VerificationResult
 
 
@@ -44,11 +45,17 @@ class HeuristicVerifier:
                 abstain=True,
             )
 
-        # Find the winning candidate by text match.
+        # Find the winning candidate. Synthesizer.pick returns one of the
+        # strip_thinking()'d candidate texts, so a raw candidate carrying a
+        # trailing newline (or a <think> block) never equals `chosen` under a
+        # naive `c.text == chosen`. That mismatch used to drop the real winner
+        # to scored[0] @ 0.3 ("heuristic non-winner"), tripping the 0.4
+        # abstention threshold on essentially every multi-candidate prompt.
+        # Compare on the SAME normalized form Synthesizer.pick used.
         scored: list[Candidate] = []
         winner: Candidate | None = None
         for c in candidates:
-            if c.text == chosen and winner is None:
+            if winner is None and strip_thinking(c.text) == chosen:
                 w = c.with_score(0.7, f"heuristic[{self.tag}] winner")
                 scored.append(w)
                 winner = w

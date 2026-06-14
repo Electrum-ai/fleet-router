@@ -118,6 +118,38 @@ async def test_system_prompt_forwarded(router):
 
 
 @pytest.mark.asyncio
+async def test_system_prompt_from_config_when_caller_omits():
+    """When the caller passes system=None, the config-level default is used."""
+    cfg = Config()
+    cfg.system_prompt = "You are a research agent."
+    router = FleetRouter(cfg)
+    with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
+         patch.object(router._registry, "get_best_for_tag", return_value="model"), \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_dispatch:
+        mock_dispatch.return_value = {"model": "result"}
+
+        result = await router.ask("prompt")
+        assert result == "result"
+        assert mock_dispatch.call_args.kwargs["system"] == "You are a research agent."
+
+
+@pytest.mark.asyncio
+async def test_caller_system_overrides_config_default():
+    """An explicit system= arg takes precedence over the config default."""
+    cfg = Config()
+    cfg.system_prompt = "You are a research agent."
+    router = FleetRouter(cfg)
+    with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
+         patch.object(router._registry, "get_best_for_tag", return_value="model"), \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_dispatch:
+        mock_dispatch.return_value = {"model": "result"}
+
+        result = await router.ask("prompt", system="Override prompt")
+        assert result == "result"
+        assert mock_dispatch.call_args.kwargs["system"] == "Override prompt"
+
+
+@pytest.mark.asyncio
 async def test_empty_string_response_not_treated_as_failure(router):
     with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
          patch.object(router._registry, "get_best_for_tag", return_value="model"), \
@@ -138,6 +170,66 @@ async def test_force_model_returns_error_when_model_fails(router):
         assert "gpt-4" in result  # error includes model name for context
         mock_dispatch.assert_awaited_once()
         assert mock_dispatch.call_args[0][1] == ["gpt-4"]
+
+
+@pytest.mark.asyncio
+async def test_force_model_all_thinking_does_not_leak_raw_cot(router):
+    """Regression: a forced model whose entire output is a <think> block
+    strips to "". `strip_thinking(result) or result` returned the RAW think
+    block — the exact CoT leak this guards against. It must return the failure
+    sentinel, never text containing '<think>'."""
+    with patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_dispatch:
+        mock_dispatch.return_value = {"gpt-4": "<think>secret reasoning the user must never see</think>"}
+
+        result = await router.ask("prompt", force_model="gpt-4")
+        assert "<think>" not in result
+        assert result == ERROR_ALL_MODELS_FAILED
+
+
+@pytest.mark.asyncio
+async def test_force_model_unclosed_thinking_does_not_leak_raw_cot(router):
+    """Truncated-mid-thought variant: an unclosed <think> tag also strips to
+    "" and must not leak."""
+    with patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_dispatch:
+        mock_dispatch.return_value = {"gpt-4": "<think>reasoning that got cut off and never"}
+
+        result = await router.ask("prompt", force_model="gpt-4")
+        assert "<think>" not in result
+        assert result == ERROR_ALL_MODELS_FAILED
+
+
+@pytest.mark.asyncio
+async def test_single_primary_all_thinking_does_not_leak_raw_cot(router):
+    """Regression: the _single primary return used `strip_thinking(result) or
+    result`, leaking a raw all-CoT primary output. It must surface the failure
+    sentinel instead."""
+    with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
+         patch.object(router._registry, "get_best_for_tag", return_value="primary-model"), \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_dispatch:
+        mock_dispatch.return_value = {"primary-model": "<think>only internal reasoning here</think>"}
+
+        result = await router.ask("prompt")
+        assert "<think>" not in result
+        assert result == ERROR_ALL_MODELS_FAILED
+
+
+@pytest.mark.asyncio
+async def test_single_fallback_skips_all_thinking_model(router):
+    """Regression: the _single fallback loop used `strip_thinking(fb) or fb`,
+    so an all-CoT fallback leaked raw reasoning. The loop must now skip a
+    fallback that strips to "" and try the next model."""
+    with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
+         patch.object(router._registry, "get_best_for_tag", return_value="primary-model"), \
+         patch.object(router._registry, "all_available", return_value=["fb-cot", "fb-good"]), \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_dispatch:
+        mock_dispatch.side_effect = [
+            {"primary-model": None},
+            {"fb-cot": "<think>all reasoning, no answer</think>", "fb-good": "real answer"},
+        ]
+
+        result = await router.ask("prompt")
+        assert "<think>" not in result
+        assert result == "real answer"
 
 
 @pytest.mark.asyncio

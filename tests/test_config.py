@@ -105,6 +105,57 @@ models:
     assert cfg.models["weird"].model_class == "chat"
 
 
+def test_timeouts_default_when_no_thresholds_block():
+    """Bare Config() gets the documented per-class defaults."""
+    cfg = Config()
+    assert cfg.thresholds.timeouts == {"chat": 60, "reasoning": 240}
+
+
+def test_timeouts_derived_from_parallel_timeout_when_absent(tmp_path):
+    """A config that only sets parallel_timeout (no `timeouts` block) derives
+    per-class budgets so reasoning models are never cut at the chat budget."""
+    yaml_text = """
+thresholds:
+  parallel_timeout: 90
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    # chat == parallel_timeout; reasoning == max(parallel_timeout, 240).
+    assert cfg.thresholds.timeouts == {"chat": 90, "reasoning": 240}
+
+
+def test_timeouts_derived_keeps_large_parallel_timeout_for_reasoning(tmp_path):
+    """If parallel_timeout already exceeds 240, reasoning derives to it."""
+    yaml_text = """
+thresholds:
+  parallel_timeout: 300
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.thresholds.timeouts == {"chat": 300, "reasoning": 300}
+
+
+def test_timeouts_explicit_parse_coerces_and_ignores_junk(tmp_path):
+    """Explicit per-class budgets are coerced to ints; junk values are ignored
+    and missing keys keep their defaults."""
+    yaml_text = """
+thresholds:
+  parallel_timeout: 60
+  timeouts:
+    chat: 30
+    reasoning: not-a-number
+    code: "120"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.thresholds.timeouts["chat"] == 30      # overridden
+    assert cfg.thresholds.timeouts["reasoning"] == 240  # junk ignored, default kept
+    assert cfg.thresholds.timeouts["code"] == 120     # coerced from string
+
+
 def test_ollama_api_key_parsed(tmp_path):
     yaml_text = """
 ollama:
@@ -195,3 +246,174 @@ bandit:
     assert cfg.refinement.enabled is False
     assert cfg.escalation.enabled is False
     assert cfg.bandit.enabled is False
+
+
+def test_synthesis_code_execute_sandbox_default_empty():
+    """C1: a config with no synthesis block defaults the sandbox to empty —
+    which (combined with code_execute defaulting False) means code never runs."""
+    cfg = Config()
+    assert cfg.synthesis.code_execute is False
+    assert cfg.synthesis.code_execute_sandbox == ""
+
+
+def test_synthesis_code_execute_sandbox_parsed(tmp_path):
+    yaml_text = """
+synthesis:
+  code_execute: true
+  code_execute_sandbox: "firejail --net=none --private={dir} {python} {file}"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.synthesis.code_execute is True
+    assert cfg.synthesis.code_execute_sandbox == \
+        "firejail --net=none --private={dir} {python} {file}"
+
+
+def test_bandit_decay_and_seeding_defaults():
+    """Defaults: no decay (1.0), mild priority seeding (0.5)."""
+    cfg = Config()
+    assert cfg.bandit.decay == 1.0
+    assert cfg.bandit.priority_prior_strength == 0.5
+
+
+def test_bandit_decay_and_seeding_parsed(tmp_path):
+    yaml_text = """
+bandit:
+  decay: 0.9
+  priority_prior_strength: 1.5
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.bandit.decay == 0.9
+    assert cfg.bandit.priority_prior_strength == 1.5
+
+
+def test_bandit_decay_out_of_range_falls_back_to_one(tmp_path):
+    """decay outside (0, 1] (and junk) coerces to 1.0 = no decay."""
+    for bad in ("0.0", "-0.5", "1.5", "notanumber"):
+        yaml_text = f"bandit:\n  decay: {bad}\n"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml_text)
+        cfg = load_config(config_path)
+        assert cfg.bandit.decay == 1.0
+
+
+def test_bandit_negative_seeding_strength_clamped_to_zero(tmp_path):
+    yaml_text = """
+bandit:
+  priority_prior_strength: -2.0
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.bandit.priority_prior_strength == 0.0
+
+
+def test_synthesis_code_execute_sandbox_coerces_non_string(tmp_path):
+    yaml_text = """
+synthesis:
+  code_execute_sandbox: 12345
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    # Non-string coerces to its str form (or empty), never crashes.
+    assert isinstance(cfg.synthesis.code_execute_sandbox, str)
+
+
+# --------------------------------------------------------------------------- #
+# Per-tag abstention thresholds (Part A)
+# --------------------------------------------------------------------------- #
+
+
+def test_abstention_thresholds_default_empty():
+    """No override map by default ⇒ every tag uses the global 0.4."""
+    cfg = Config()
+    assert cfg.synthesis.abstention_threshold == 0.4
+    assert cfg.synthesis.abstention_thresholds == {}
+
+
+def test_abstention_thresholds_parsed_and_floats_coerced(tmp_path):
+    yaml_text = """
+synthesis:
+  abstention_threshold: 0.4
+  abstention_thresholds:
+    math: 0.6
+    code: "0.55"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.synthesis.abstention_thresholds == {"math": 0.6, "code": 0.55}
+
+
+def test_abstention_thresholds_clamped_to_unit_interval(tmp_path):
+    yaml_text = """
+synthesis:
+  abstention_thresholds:
+    high: 1.7
+    low: -0.3
+    ok: 0.5
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.synthesis.abstention_thresholds == {
+        "high": 1.0, "low": 0.0, "ok": 0.5,
+    }
+
+
+def test_abstention_thresholds_drops_junk_keys_and_values(tmp_path):
+    yaml_text = """
+synthesis:
+  abstention_thresholds:
+    math: 0.6
+    bad: "not-a-number"
+    none_val: null
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    # Only the parseable numeric entry survives; junk is silently dropped.
+    assert cfg.synthesis.abstention_thresholds == {"math": 0.6}
+
+
+def test_abstention_thresholds_non_mapping_ignored(tmp_path):
+    yaml_text = """
+synthesis:
+  abstention_thresholds: "oops not a dict"
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.synthesis.abstention_thresholds == {}
+
+
+def test_system_prompt_loaded_from_yaml(tmp_path):
+    yaml_text = """
+system_prompt: |
+  You are a research agent.
+  Follow best practices.
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert "research agent" in cfg.system_prompt
+    assert "best practices" in cfg.system_prompt
+
+
+def test_system_prompt_defaults_empty():
+    cfg = Config()
+    assert cfg.system_prompt == ""
+
+
+def test_system_prompt_non_string_ignored(tmp_path):
+    yaml_text = """
+system_prompt: 42
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.system_prompt == ""

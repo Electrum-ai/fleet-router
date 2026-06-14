@@ -134,6 +134,34 @@ async def test_ollama_semaphore_caps_concurrent_requests():
 
 
 @pytest.mark.asyncio
+async def test_ollama_per_request_timeout_overrides_session_default():
+    """A GenerateRequest.timeout must be passed to session.post as a
+    ClientTimeout, overriding the session-wide default per request."""
+    p = OllamaProvider(timeout=60)
+    req = GenerateRequest(model="glm", prompt="hi", timeout=240)
+    with patch("aiohttp.ClientSession.post") as mock_post:
+        _setup_post(mock_post)
+        await p.generate(req)
+    await p.aclose()
+    passed = mock_post.call_args.kwargs["timeout"]
+    assert isinstance(passed, aiohttp.ClientTimeout)
+    assert passed.total == 240
+
+
+@pytest.mark.asyncio
+async def test_ollama_no_per_request_timeout_falls_back_to_session():
+    """Without request.timeout, no per-request timeout kwarg is sent — the
+    shared session default applies."""
+    p = OllamaProvider(timeout=60)
+    req = GenerateRequest(model="glm", prompt="hi")  # timeout left None
+    with patch("aiohttp.ClientSession.post") as mock_post:
+        _setup_post(mock_post)
+        await p.generate(req)
+    await p.aclose()
+    assert "timeout" not in mock_post.call_args.kwargs
+
+
+@pytest.mark.asyncio
 async def test_ollama_list_models():
     p = OllamaProvider()
     with patch("aiohttp.ClientSession.get") as mock_get:

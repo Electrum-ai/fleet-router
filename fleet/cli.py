@@ -49,6 +49,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Eval mode only: save current aggregates as the new baseline",
     )
     parser.add_argument(
+        "--repeats", type=int, default=1, metavar="N",
+        help="Eval mode only: run each case N times for the paired "
+             "significance gate (default 1)",
+    )
+    parser.add_argument(
+        "--calibrate", default=None, metavar="OUT.yaml",
+        help="Eval mode only: fit per-tag abstention thresholds from this "
+             "run's outcomes and write the config-ready block to OUT.yaml "
+             "(use with --repeats to gather enough observations per tag)",
+    )
+    parser.add_argument(
         "--serve", action="store_true",
         help="Launch Anthropic-compatible HTTP proxy (use with Claude Code)",
     )
@@ -109,9 +120,11 @@ def _run_ask(router: FleetRouter, args: argparse.Namespace) -> int:
 def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
     # Lazy import — eval module not needed for the common ask path.
     from evals.runner import (
-        aggregate, compare_to_baseline, load_fixtures, run_eval, save_baseline,
+        aggregate, compare_to_baseline, load_fixtures, run_eval_detailed,
+        save_baseline,
     )
 
+    repeats = max(1, int(getattr(args, "repeats", 1) or 1))
     fixtures_dir = Path(args.eval)
     try:
         cases = load_fixtures(fixtures_dir)
@@ -124,12 +137,12 @@ def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
 
     async def _run_and_close():
         try:
-            return await run_eval(router, cases)
+            return await run_eval_detailed(router, cases, repeats=repeats)
         finally:
             await router.aclose()
 
     try:
-        results = asyncio.run(_run_and_close())
+        per_case = asyncio.run(_run_and_close())
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
@@ -137,19 +150,44 @@ def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
         print(f"fleet: eval failed — {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
+    from evals.scorers import EvalResult as _EvalResult
+    results = [
+        _EvalResult(
+            case=pc.case,
+            answer=pc.answers[-1] if pc.answers else "",
+            score=pc.mean_score,
+            notes=pc.notes,
+        )
+        for pc in per_case
+    ]
     aggregates = aggregate(results)
 
     print(json.dumps({
         "n_cases": len(cases),
+        "repeats": repeats,
         "aggregates": aggregates,
     }, indent=2))
 
+    if getattr(args, "calibrate", None):
+        from evals.calibrate import calibrate, write_thresholds
+        from evals.runner import calibration_records
+
+        result = calibrate(calibration_records(per_case))
+        write_thresholds(result, args.calibrate)
+        print(json.dumps({"calibration": result.summary()}, indent=2))
+        print(
+            f"\nabstention thresholds written to {args.calibrate}",
+            file=sys.stderr,
+        )
+
     if args.save_baseline:
-        save_baseline(aggregates, args.save_baseline)
+        save_baseline(aggregates, args.save_baseline, per_case=per_case)
         print(f"\nbaseline saved to {args.save_baseline}", file=sys.stderr)
 
     if args.baseline:
-        regressed, messages = compare_to_baseline(aggregates, args.baseline)
+        regressed, messages = compare_to_baseline(
+            aggregates, args.baseline, current_per_case=per_case,
+        )
         print("\n--- comparison ---", file=sys.stderr)
         for m in messages:
             print(m, file=sys.stderr)
@@ -160,9 +198,34 @@ def _run_eval(router: FleetRouter, args: argparse.Namespace) -> int:
     return 0
 
 
+# Hosts that only ever accept connections from the same machine. Binding to
+# any of these without an API key is the single-user default and stays
+# allowed; binding to anything else (0.0.0.0, a LAN IP, a public hostname)
+# without a key would expose the operator's Ollama compute as an open relay.
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+
+
 def _run_serve(router: FleetRouter, args: argparse.Namespace) -> int:
     # Lazy import — proxy module pulls in aiohttp.web, only needed here.
     from fleet.proxy import serve
+
+    # Refuse to bind a non-loopback interface without authentication. Without
+    # this guard, `fleet --serve --host 0.0.0.0` is an unauthenticated relay to
+    # the operator's Ollama compute for anyone on the network.
+    host = (args.host or "").strip()
+    if host.lower() not in _LOOPBACK_HOSTS and not args.api_key:
+        print(
+            f"fleet: refusing to bind non-loopback host {args.host!r} without "
+            "an API key.\n"
+            "       This would expose your Ollama backend as an open relay.\n"
+            "       Pass --api-key to require authentication, e.g.:\n"
+            "         fleet --serve --host "
+            f"{args.host} --api-key \"$(openssl rand -hex 32)\"\n"
+            "       Or bind a loopback host (127.0.0.1 / localhost) for "
+            "single-user local use.",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         serve(router, host=args.host, port=args.port, api_key=args.api_key)

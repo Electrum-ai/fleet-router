@@ -149,3 +149,59 @@ def test_eval_command_missing_fixtures_dir(tmp_path, capsys):
     captured = capsys.readouterr()
     assert rc == 1
     assert "fixtures directory not found" in captured.err
+
+
+# ---------- H1: refuse non-loopback bind without an API key ----------
+
+
+def test_serve_non_loopback_without_key_refuses(capsys):
+    """`fleet --serve --host 0.0.0.0` with no key must error out WITHOUT
+    binding — otherwise it's an open relay to the operator's Ollama."""
+    with patch("fleet.cli.FleetRouter") as router_cls, \
+            patch("fleet.proxy.serve") as serve:
+        router_cls.return_value.aclose = AsyncMock()
+        rc = cli.main(["--serve", "--host", "0.0.0.0"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    serve.assert_not_called()
+    assert "refusing to bind" in captured.err
+    assert "--api-key" in captured.err
+
+
+def test_serve_non_loopback_with_key_proceeds():
+    with patch("fleet.cli.FleetRouter") as router_cls, \
+            patch("fleet.proxy.serve") as serve:
+        router_cls.return_value.aclose = AsyncMock()
+        rc = cli.main(["--serve", "--host", "0.0.0.0", "--api-key", "secret"])
+    assert rc == 0
+    serve.assert_called_once()
+    assert serve.call_args.kwargs["host"] == "0.0.0.0"
+    assert serve.call_args.kwargs["api_key"] == "secret"
+
+
+def test_serve_loopback_without_key_proceeds():
+    """The single-user local default: 127.0.0.1 with no key stays allowed."""
+    with patch("fleet.cli.FleetRouter") as router_cls, \
+            patch("fleet.proxy.serve") as serve:
+        router_cls.return_value.aclose = AsyncMock()
+        rc = cli.main(["--serve", "--host", "127.0.0.1"])
+    assert rc == 0
+    serve.assert_called_once()
+
+
+def test_serve_localhost_without_key_proceeds():
+    with patch("fleet.cli.FleetRouter") as router_cls, \
+            patch("fleet.proxy.serve") as serve:
+        router_cls.return_value.aclose = AsyncMock()
+        rc = cli.main(["--serve", "--host", "localhost"])
+    assert rc == 0
+    serve.assert_called_once()
+
+
+def test_serve_lan_ip_without_key_refuses(capsys):
+    with patch("fleet.cli.FleetRouter") as router_cls, \
+            patch("fleet.proxy.serve") as serve:
+        router_cls.return_value.aclose = AsyncMock()
+        rc = cli.main(["--serve", "--host", "192.168.1.50"])
+    assert rc == 1
+    serve.assert_not_called()

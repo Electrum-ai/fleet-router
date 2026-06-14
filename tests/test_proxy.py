@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from fleet.proxy import (
+    _client_safe_error,
+    _coerce_int,
+    _default_allowed_hosts,
     _flatten_content,
+    _host_only,
+    _make_host_guard,
     _maybe_enrich_with_ollama_hint,
     _parse_openai_chat_request,
     _parse_request,
@@ -690,12 +696,18 @@ async def test_streaming_router_failure_yields_clean_stream_close():
     names = [n for n, _ in events]
     assert names[0] == "message_start"
     assert names[-1] == "message_stop"
-    # The error text should be in a content_block_delta.
+    # The error text should be in a content_block_delta — but GENERIC: the
+    # internal exception message must NOT leak (M2). A correlation id is
+    # surfaced instead so operators can triage against the server log.
     deltas = [
         d["delta"]["text"] for n, d in events
         if n == "content_block_delta" and d.get("delta", {}).get("type") == "text_delta"
     ]
-    assert any("router error" in t and "ollama crashed mid-prompt" in t for t in deltas)
+    joined = "".join(deltas)
+    assert "router error" in joined
+    assert "ollama crashed mid-prompt" not in joined
+    assert "RuntimeError" not in joined
+    assert re.search(r"id=[0-9a-f]{8}", joined)
 
 
 @pytest.mark.asyncio
@@ -764,3 +776,239 @@ async def test_concurrent_proxy_requests_all_complete():
         results = await asyncio.gather(*(one_request(i) for i in range(20)))
     assert all(r == "answer" for r in results)
     assert router.call_count == 20
+
+
+# ---------- M1: Host-header allowlist (DNS-rebinding / CSRF defense) ----------
+
+
+class _FakeReq:
+    def __init__(self, host):
+        self.headers = {} if host is None else {"Host": host}
+
+
+async def _ok_handler(_request):
+    return "ok"
+
+
+def test_host_only_extracts_hostname():
+    assert _host_only("localhost:8765") == "localhost"
+    assert _host_only("127.0.0.1:8765") == "127.0.0.1"
+    assert _host_only("evil.com:8765") == "evil.com"
+    assert _host_only("[::1]:8765") == "::1"
+    assert _host_only("::1") == "::1"
+    assert _host_only("LOCALHOST:8765") == "localhost"
+
+
+def test_default_allowed_hosts_includes_loopback_and_bind():
+    allowed = _default_allowed_hosts("192.168.1.5", 8765)
+    assert "127.0.0.1:8765" in allowed
+    assert "localhost:8765" in allowed
+    assert "[::1]:8765" in allowed
+    assert "192.168.1.5:8765" in allowed
+
+
+def test_default_allowed_hosts_skips_wildcard_bind():
+    allowed = _default_allowed_hosts("0.0.0.0", 8765)
+    assert "0.0.0.0:8765" not in allowed
+    assert "127.0.0.1:8765" in allowed
+
+
+@pytest.mark.asyncio
+async def test_host_guard_rejects_missing_host():
+    guard = _make_host_guard({"127.0.0.1:8765"})
+    with pytest.raises(web.HTTPMisdirectedRequest):
+        await guard(_FakeReq(None), _ok_handler)
+
+
+@pytest.mark.asyncio
+async def test_host_guard_rejects_foreign_host():
+    guard = _make_host_guard({"127.0.0.1:8765"})
+    with pytest.raises(web.HTTPMisdirectedRequest):
+        await guard(_FakeReq("evil.com:8765"), _ok_handler)
+
+
+@pytest.mark.asyncio
+async def test_host_guard_allows_loopback_any_port():
+    guard = _make_host_guard({"127.0.0.1:8765"})
+    # Ephemeral-port loopback (what the aiohttp test server uses) is allowed.
+    assert await guard(_FakeReq("127.0.0.1:54321"), _ok_handler) == "ok"
+    assert await guard(_FakeReq("localhost:9999"), _ok_handler) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_host_guard_allows_explicit_allowlisted_host():
+    guard = _make_host_guard({"fleet.internal:8765"})
+    assert await guard(_FakeReq("fleet.internal:8765"), _ok_handler) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_messages_rejects_foreign_host_header_421():
+    router = _StubRouter("hi")
+    app = build_app(router)  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/v1/messages",
+            json={"model": "x", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Host": "evil.com:8765"},
+        )
+        assert resp.status == 421
+
+
+@pytest.mark.asyncio
+async def test_healthz_reachable_under_host_guard():
+    """The boot poller hits 127.0.0.1/healthz — must stay reachable."""
+    app = build_app(_StubRouter())  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/healthz")
+        assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_custom_allowed_hosts_honored_over_http():
+    router = _StubRouter("hi")
+    app = build_app(router, allowed_hosts={"fleet.internal:8765"})  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        ok = await client.post(
+            "/v1/messages",
+            json={"model": "x", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Host": "fleet.internal:8765"},
+        )
+        assert ok.status == 200
+        bad = await client.post(
+            "/v1/messages",
+            json={"model": "x", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Host": "other.internal:8765"},
+        )
+        assert bad.status == 421
+
+
+# ---------- M2: generic client errors, full detail server-side only ----------
+
+
+def test_client_safe_error_redacts_and_correlates(caplog):
+    import logging
+
+    with caplog.at_level(logging.ERROR, logger="fleet.proxy"):
+        try:
+            raise RuntimeError("backend at http://10.0.0.1:11434 model=secret blew up")
+        except RuntimeError as exc:
+            msg = _client_safe_error(exc, "unit-test")
+
+    # Client-facing string carries NO internal detail, just a correlation id.
+    assert "RuntimeError" not in msg
+    assert "10.0.0.1" not in msg
+    assert "secret" not in msg
+    m = re.search(r"id=([0-9a-f]{8})", msg)
+    assert m is not None
+    corr_id = m.group(1)
+    # The same id is in the server log, alongside the full traceback.
+    joined = "\n".join(r.message for r in caplog.records)
+    assert corr_id in joined
+    assert any(r.exc_info for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_messages_non_stream_error_is_generic():
+    class _BoomRouter:
+        async def ask(self, *args, **kwargs):
+            raise RuntimeError("ollama at /private/path crashed")
+
+    app = build_app(_BoomRouter())  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/messages", json={
+            "model": "x", "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status == 500
+        reason = resp.reason or ""
+    assert "RuntimeError" not in reason
+    assert "private" not in reason
+    assert re.search(r"id=[0-9a-f]{8}", reason)
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_non_stream_error_is_generic():
+    class _BoomRouter:
+        def __init__(self):
+            self._registry = _FakeRegistry([])
+
+        async def ask(self, *args, **kwargs):
+            raise RuntimeError("model deepseek-v4-pro at backend blew up")
+
+    app = build_app(_BoomRouter())  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/chat/completions", json={
+            "model": "x", "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status == 500
+        reason = resp.reason or ""
+    assert "RuntimeError" not in reason
+    assert "deepseek" not in reason
+    assert re.search(r"id=[0-9a-f]{8}", reason)
+
+
+# ---------- M3: request body shape validation ----------
+
+
+def test_coerce_int_falls_back_on_garbage():
+    assert _coerce_int("abc", 4096) == 4096
+    assert _coerce_int(None, 4096) == 4096
+    assert _coerce_int("100", 4096) == 100
+    assert _coerce_int(256, 4096) == 256
+
+
+@pytest.mark.asyncio
+async def test_messages_array_body_returns_400():
+    app = build_app(_StubRouter())  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/messages", data=json.dumps([1, 2, 3]),
+                                 headers={"Content-Type": "application/json"})
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_messages_string_body_returns_400():
+    app = build_app(_StubRouter())  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/messages", data=json.dumps("just a string"),
+                                 headers={"Content-Type": "application/json"})
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_array_body_returns_400():
+    app = build_app(_StubRouter())  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/chat/completions", data=json.dumps([1, 2]),
+                                 headers={"Content-Type": "application/json"})
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_messages_non_int_max_tokens_uses_default():
+    router = _StubRouter("ok")
+    app = build_app(router)  # type: ignore[arg-type]
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/messages", json={
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": "abc",
+        })
+        assert resp.status == 200
+
+
+def test_parse_request_non_int_max_tokens_falls_back():
+    parsed = _parse_request({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": "abc",
+    })
+    assert parsed.max_tokens == 4096
+
+
+def test_parse_openai_non_int_max_tokens_falls_back():
+    parsed = _parse_openai_chat_request({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": "abc",
+    })
+    assert parsed.max_tokens == 4096

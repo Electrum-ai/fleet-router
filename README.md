@@ -13,7 +13,7 @@
 *Quality-first. Not fastest. Not cheapest. **Best answer.***
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-256%20passing-2ea44f)](#testing)
+[![Tests](https://img.shields.io/badge/tests-362%20passing-2ea44f)](#testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Runtime: Ollama](https://img.shields.io/badge/runtime-Ollama-FF6B35?logo=ollama&logoColor=white)](https://ollama.com)
 [![Quality: Max by default](https://img.shields.io/badge/quality-max%20by%20default-blueviolet)](#quality-by-default)
@@ -84,7 +84,7 @@ The trade: **per-prompt latency goes 10–30× and cost goes 20–80×, in excha
 
 ### Quality by default
 
-Out of the box, every quality lever is **ON**: parallel ensemble, multi-sample self-consistency, verifier-driven scoring, LLM-as-judge, calibrated abstention, disagreement escalation, critique-and-revise refinement, and bandit learning. The only quality lever that ships **OFF** is `code_execute` — running LLM-generated code is a real RCE vector even with static safety checks, so opting in is a deliberate choice.
+Out of the box, every quality lever is **ON**: parallel ensemble, multi-sample self-consistency, verifier-driven scoring, LLM-as-judge, calibrated abstention, disagreement escalation, critique-and-revise refinement, and bandit learning. The only quality lever that ships **OFF** is `code_execute` — running LLM-generated code is a real RCE vector. Even when you opt in, execution is **hard-gated**: code runs only when you also supply a `code_execute_sandbox` command (firejail/bubblewrap/Docker/etc.) for it to run through. With `code_execute: true` but no sandbox, the verifier logs a warning and falls back to AST-only static scoring — it never runs the code. The AST denylist is an **advisory pre-filter, not a security boundary** (it is trivially bypassable), so the sandbox is the only real isolation.
 
 To downshift (faster, cheaper, lower quality), opt out explicitly in `~/.fleet/config.yaml`. See [Configuration](#configuration).
 
@@ -141,7 +141,7 @@ flowchart LR
 
 | Tag | Verifier | Quality Signal |
 |---|---|---|
-| `code` | `CodeVerifier` | AST validity + (opt-in) sandboxed execution |
+| `code` | `CodeVerifier` | AST validity + (opt-in) execution, hard-gated behind a sandbox |
 | `math` | `MathVerifier` | Numeric extraction + cross-sample majority vote |
 | `reasoning`, `creative`, `summarize`, `translate`, `general` | `JudgeVerifier` | LLM-as-judge with tag-specific rubric |
 | any (fallback) | `HeuristicVerifier` | Length / AST / diversity (legacy synthesizer) |
@@ -151,7 +151,7 @@ flowchart LR
 ## Features
 
 ### 🔬 Verifier-driven synthesis
-No more "longest" or "lexically diverse" winning. Each tag has an executable or judge-based scorer. Code is AST-validated (and optionally sandbox-executed). Math runs majority vote over numeric answers. Reasoning/creative/etc. go to an LLM judge with a tag-specific rubric.
+No more "longest" or "lexically diverse" winning. Each tag has an executable or judge-based scorer. Code is AST-validated (and optionally executed, but only through an operator-configured sandbox — see `code_execute_sandbox`). Math runs majority vote over numeric answers. Reasoning/creative/etc. go to an LLM judge with a tag-specific rubric.
 
 ### 🎯 Self-consistency sampling
 Math and reasoning tags sample the same model N times (default 5 / 3) and majority-vote. On GSM8K-class problems this closes most of the gap to frontier models with the same base LLM.
@@ -352,8 +352,13 @@ synthesis:
   mode: verifier
   judge_model: deepseek-v4-pro  # strongest model arbitrates judge-based tags
   abstention_threshold: 0.4
-  code_execute: false           # OFF for security — opt in only if you trust the sandbox
+  code_execute: false           # OFF for security — running LLM code is an RCE vector
   code_execute_timeout: 5
+  # Sandbox command TEMPLATE. Execution happens ONLY when code_execute is true
+  # AND this is non-empty; code then runs THROUGH this command (never raw).
+  # {python}/{file}/{dir} are substituted at run time. Empty → never executes
+  # (AST-only scoring). The AST denylist is advisory, NOT a sandbox boundary.
+  code_execute_sandbox: ""      # e.g. "firejail --net=none --private={dir} {python} {file}"
 
 sampling:
   samples_by_tag:
@@ -458,7 +463,7 @@ Keyword regex with **saturating exponential** scoring (1 match → 0.55, 2 → 0
 
 ### Verification
 
-Per-tag verifiers replace heuristics. `CodeVerifier` AST-walks for dangerous patterns (subprocess, eval, file I/O, network) and **refuses to execute** unsafe code even with `code_execute=true`. `MathVerifier` extracts final numeric answers (handling `\boxed{}`, "answer is X", scientific notation, decimals) and majority-votes. `JudgeVerifier` sends labeled candidates to an Ollama judge with a tag-specific rubric and parses ranked output (with JSON-extraction fallback for verbose models).
+Per-tag verifiers replace heuristics. `CodeVerifier` AST-walks for dangerous patterns (subprocess, eval, file I/O, network) as an **advisory pre-filter** and refuses to even hand obviously-dangerous code to the sandbox. This denylist is **not** a security boundary (it is trivially bypassable via `getattr`/`__subclasses__`), so execution is hard-gated: candidate code runs only when `code_execute=true` **and** a `code_execute_sandbox` command template is configured, and then only *through* that sandbox. With no sandbox, the verifier warns and scores by AST alone. `MathVerifier` extracts final numeric answers (handling `\boxed{}`, "answer is X", scientific notation, decimals) and majority-votes. `JudgeVerifier` sends labeled candidates to an Ollama judge with a tag-specific rubric and parses ranked output (with JSON-extraction fallback for verbose models).
 
 ### Calibrated Abstention
 
@@ -480,7 +485,7 @@ Beats a confident wrong answer.
 
 ### Outcome-Driven Bandit
 
-Thompson sampling over `(tag, model)` Beta posteriors. **Reward signal = verifier/judge score in [0,1]** — never latency, never cost. Each sampled candidate is an independent observation, so `samples_per_model=5` gives the bandit 5× more signal per dispatch. State persists atomically to `~/.fleet/bandit.json`. With bandit enabled, the router Thompson-ranks the **full** tag-matching pool (not just `max_parallel` head-of-line candidates) so it can explore.
+Thompson sampling over `(tag, model)` Beta posteriors. **Reward signal = verifier/judge score in [0,1]** — never latency, never cost. The N samples a model emits in one round are correlated draws from a single generation, so they collapse to **one aggregated observation per model per round** (the mean candidate score) — `samples_per_model=5` sharpens that observation's score *estimate*, it does not give the bandit 5× the observation count. Two knobs tune the prior: `bandit.decay` (in `(0,1]`, default `1.0` = no decay) applies exponential forgetting so stale evidence from a since-upgraded model fades; `bandit.priority_prior_strength` (default `0.5`) seeds a fresh arm with a mild priority-biased prior (`alpha = 1 + strength/priority`, `beta = 1`) so the cold start respects the configured priority ordering instead of random-shuffling. State persists atomically to `~/.fleet/bandit.json`. With bandit enabled, the router Thompson-ranks the **full** tag-matching pool (not just `max_parallel` head-of-line candidates) so it can explore.
 
 ---
 
@@ -508,14 +513,14 @@ Built-in scorers:
 ## Testing
 
 ```bash
-pytest tests/                # 256 passing
+pytest tests/                # 362 passing (1 skips without sentence-transformers)
 pytest tests/verifiers/      # verifier framework
 pytest tests/evals/          # harness + scorers
 pytest tests/test_proxy.py   # Anthropic + OpenAI proxy compatibility
 pytest tests/test_cli.py     # CLI: ask / eval / serve / quiet
 ```
 
-256 tests across 28 files cover providers (including session reuse + concurrency-cap regression guards), verifiers (code/math/judge/heuristic), self-consistency, escalation, refinement, abstention (including self-judge bias guards), bandit (selection + posterior updates + persistence), event bus + progress sink, LLM classifier, retrieval, eval harness + comparison harness, CLI (including eval + serve subcommands + aclose lifecycle), Anthropic + OpenAI proxy compatibility (parsing, streaming heartbeat/deadline, force-model resolver, auth, ollama-down enrichment, concurrent requests), max-quality default policy, and config validation.
+362 tests across 31 files cover providers (including session reuse + concurrency-cap + per-class timeout-budget guards), verifiers (code/math/judge/heuristic, including the thinking-strip and code-execution hard-gate), self-consistency, escalation, refinement (with closed-loop output verification), abstention (including self-judge bias guards), bandit (selection + posterior updates + persistence), event bus + progress sink, LLM classifier (and its router wiring), retrieval (and its router wiring), eval harness + comparison harness, CLI (including eval + serve subcommands, the non-loopback-bind guard, and aclose lifecycle), Anthropic + OpenAI proxy compatibility (parsing, streaming heartbeat/deadline, force-model resolver, auth, Host-allowlist, error redaction, body validation, ollama-down enrichment, concurrent requests), the ensure-proxy hardening (run-dir perms, O_NOFOLLOW, kill verification), max-quality default policy, and config validation.
 
 ---
 
@@ -526,6 +531,9 @@ pytest tests/test_cli.py     # CLI: ask / eval / serve / quiet
 | ✅ Shipped | Verifier framework, self-consistency, calibrated abstention, bandit, eval harness, refinement, escalation, retrieval scaffold, event bus |
 | ✅ Shipped | Anthropic Messages API proxy + OpenAI Chat Completions proxy (drop-in backend for Claude Code, aider, and openai SDK) |
 | ✅ Shipped | Force-model honoring in proxy + live stderr progress lines + idempotent SessionStart auto-boot |
+| ✅ Shipped | Thinking-model safety: centralized chain-of-thought stripping at the candidate boundary, per-class generation timeout budgets (reasoning models aren't cut off at the chat timeout), closed-loop verification of refinement/escalation outputs |
+| ✅ Shipped | Security hardening: non-loopback-bind API-key requirement, Host-header allowlist, error redaction, request-body validation, private 0700 runtime dir with O_NOFOLLOW, code-execution hard-gate behind an operator-supplied sandbox |
+| ✅ Shipped | LLM classifier and retrieval wired into the router (opt-in via `classifier.mode: llm` / `retrieval.enabled`) |
 | 🛠 Next | Class-aware streaming with thinking-model-safe cancellation |
 | 💭 Considering | LLM classifier as default, retrieval for `general` tag by default, Strategy plugin registry via entry points, real tool-call translation in proxy |
 
@@ -557,7 +565,7 @@ fleet-router/
 ├── scripts/
 │   ├── fleet-toggle.sh        # shell-scoped opt-in for Claude Code backend
 │   └── fleet-ensure-proxy.py  # idempotent flock-guarded auto-boot
-└── tests/                     # 256 tests across 28 files
+└── tests/                     # 362 tests across 31 files
 ```
 
 ---

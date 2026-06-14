@@ -62,9 +62,21 @@ class ModelRegistry:
         self._available = names
         self._refreshed = True
 
+    def set_available(self, names: set[str]) -> None:
+        """Seed the installed-model set without a live Ollama fetch.
+
+        Sets the refreshed flag explicitly so that an *empty* set (a valid
+        state — local Ollama has nothing pulled) is honored rather than
+        falling through to a network refresh. Tests use this instead of
+        poking `_available` directly."""
+        self._available = set(names)
+        self._refreshed = True
+
     def _ensure_refreshed(self) -> None:
-        # Tests poke `_available` directly; honor that and skip the live fetch
-        # when the registry has been pre-populated.
+        # Honor a pre-populated registry (e.g. via set_available, or a direct
+        # `_available` poke in legacy tests) and skip the live fetch. The
+        # `_refreshed` flag is the authoritative signal; the truthiness check
+        # on `_available` keeps older direct-poke callers working.
         if self._refreshed or self._available:
             return
         self.refresh()

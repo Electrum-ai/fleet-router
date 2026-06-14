@@ -1,13 +1,17 @@
 """Tests for the eval harness — uses a stub router so no Ollama needed."""
+import json
 from pathlib import Path
 
 import pytest
 
 from evals.runner import (
     aggregate,
+    aggregate_per_case,
+    case_id,
     compare_to_baseline,
     load_fixtures,
     run_eval,
+    run_eval_detailed,
     save_baseline,
 )
 from evals.scorers import EvalCase, EvalResult, KeywordContainsScorer, NumericMatchScorer
@@ -24,6 +28,21 @@ class _StubRouter:
             if prompt.startswith(prefix):
                 return ans
         return "no answer"
+
+
+class _SequenceRouter:
+    """Returns the next canned answer per prompt on each call — lets a test
+    simulate per-repeat nondeterminism without any real sampling."""
+
+    def __init__(self, sequences: dict[str, list[str]]):
+        self._sequences = {k: list(v) for k, v in sequences.items()}
+        self._idx: dict[str, int] = {}
+
+    async def ask(self, prompt: str):
+        seq = self._sequences.get(prompt, ["no answer"])
+        i = self._idx.get(prompt, 0)
+        self._idx[prompt] = i + 1
+        return seq[min(i, len(seq) - 1)]
 
 
 def test_load_fixtures_reads_jsonl(tmp_path):
@@ -111,3 +130,361 @@ def test_compare_to_baseline_within_tolerance(tmp_path):
     current = {"math": {"n": 5, "mean_score": 0.78, "pass_rate": 0.79}}
     regressed, _ = compare_to_baseline(current, baseline, regression_pp=3.0)
     assert not regressed
+
+
+# --------------------------------------------------------------------------- #
+# repeats + per-case structure
+# --------------------------------------------------------------------------- #
+
+def test_case_id_is_stable_and_distinguishes_fields():
+    assert case_id("math", "1+1?") == case_id("math", "1+1?")
+    assert case_id("math", "1+1?") != case_id("code", "1+1?")
+    # NUL-separated so concatenation collisions can't happen.
+    assert case_id("a", "bc") != case_id("ab", "c")
+
+
+@pytest.mark.asyncio
+async def test_run_eval_detailed_records_one_score_per_repeat():
+    """repeats=3 with a deterministic stub records 3 scores per case and the
+    paired path can consume them — no Ollama involved."""
+    cases = [
+        EvalCase(prompt="math1", tag="math", expected=42),
+        EvalCase(prompt="math2", tag="math", expected=10),
+    ]
+    # math1 alternates right/wrong/right; math2 always wrong.
+    router = _SequenceRouter({
+        "math1": ["answer 42", "answer 0", "answer 42"],
+        "math2": ["answer 1", "answer 2", "answer 3"],
+    })
+    scorers = {"math": NumericMatchScorer()}
+    per_case = await run_eval_detailed(router, cases, scorers, repeats=3)
+    assert len(per_case) == 2
+    assert per_case[0].scores == [1.0, 0.0, 1.0]
+    assert per_case[0].mean_score == pytest.approx(2 / 3)
+    assert per_case[0].pass_fraction == pytest.approx(2 / 3)
+    assert per_case[0].passed is True       # mean 0.67 >= 0.5
+    assert per_case[1].scores == [0.0, 0.0, 0.0]
+    assert per_case[1].passed is False
+    assert per_case[0].id == case_id("math", "math1")
+
+
+@pytest.mark.asyncio
+async def test_run_eval_repeats_one_matches_legacy_shape():
+    cases = [EvalCase(prompt="math1", tag="math", expected=42)]
+    router = _StubRouter({"math1": "the answer is 42"})
+    results = await run_eval(router, cases, {"math": NumericMatchScorer()})
+    assert len(results) == 1 and results[0].score == 1.0
+
+
+@pytest.mark.asyncio
+async def test_run_eval_repeats_returns_mean_score():
+    cases = [EvalCase(prompt="math1", tag="math", expected=42)]
+    router = _SequenceRouter({"math1": ["answer 42", "answer 0"]})
+    results = await run_eval(router, cases, {"math": NumericMatchScorer()}, repeats=2)
+    assert results[0].score == pytest.approx(0.5)  # mean of [1, 0]
+
+
+def test_run_eval_detailed_rejects_zero_repeats():
+    with pytest.raises(ValueError):
+        import asyncio
+        asyncio.run(run_eval_detailed(_StubRouter({}), [], repeats=0))
+
+
+@pytest.mark.asyncio
+async def test_aggregate_per_case_matches_aggregate():
+    cases = [
+        EvalCase(prompt="math1", tag="math", expected=42),
+        EvalCase(prompt="math2", tag="math", expected=10),
+    ]
+    router = _StubRouter({"math1": "answer 42", "math2": "answer 0"})
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()})
+    agg = aggregate_per_case(per_case)
+    assert agg["math"]["n"] == 2
+    assert agg["math"]["pass_rate"] == 0.5
+
+
+# --------------------------------------------------------------------------- #
+# baseline schema + paired gating
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_save_baseline_persists_per_case_block():
+    cases = [EvalCase(prompt="math1", tag="math", expected=42)]
+    router = _StubRouter({"math1": "answer 42"})
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()})
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "baseline.json"
+        save_baseline(aggregate_per_case(per_case), path, per_case=per_case)
+        data = json.loads(path.read_text())
+        # Legacy per-tag keys preserved...
+        assert data["math"]["pass_rate"] == 1.0
+        # ...plus the new schema marker and per-case block.
+        assert data["_schema"] == 2
+        cid = case_id("math", "math1")
+        assert cid in data["_cases"]
+        assert data["_cases"][cid]["scores"] == [1.0]
+
+
+def test_save_baseline_legacy_mode_writes_flat_map(tmp_path):
+    """Without per_case the file is byte-compatible with v1 baselines."""
+    path = tmp_path / "b.json"
+    save_baseline({"math": {"n": 5, "mean_score": 0.9, "pass_rate": 0.9}}, path)
+    data = json.loads(path.read_text())
+    assert set(data) == {"math"}
+    assert "_cases" not in data and "_schema" not in data
+
+
+def test_save_baseline_rejects_reserved_underscore_tag(tmp_path):
+    """A tag starting with '_' would collide with the reserved structural keys
+    ('_schema'/'_cases'); save_baseline must reject it rather than corrupt the
+    per-case block."""
+    path = tmp_path / "b.json"
+    with pytest.raises(ValueError, match=r"may not start with '_'"):
+        save_baseline({"_cases": {"n": 1, "mean_score": 1.0, "pass_rate": 1.0}}, path)
+    assert not path.exists()  # nothing written on rejection
+
+
+def _build_baseline(tmp_path, prompts_scores):
+    """Helper: write a v2 baseline from {prompt: [scores]} under tag 'math'."""
+    from evals.runner import PerCaseResult
+    per_case = []
+    agg_scores = []
+    for prompt, scores in prompts_scores.items():
+        pc = PerCaseResult(
+            case=EvalCase(prompt=prompt, tag="math"),
+            id=case_id("math", prompt),
+            tag="math",
+            prompt=prompt,
+            scores=list(scores),
+            answers=["x"] * len(scores),
+        )
+        per_case.append(pc)
+        agg_scores.append(pc.mean_score)
+    agg = {"math": {
+        "n": len(per_case),
+        "mean_score": sum(agg_scores) / len(agg_scores),
+        "pass_rate": sum(1 for s in agg_scores if s >= 0.5) / len(agg_scores),
+    }}
+    path = tmp_path / "baseline.json"
+    save_baseline(agg, path, per_case=per_case)
+    return path, per_case
+
+
+@pytest.mark.asyncio
+async def test_compare_paired_no_change_does_not_regress(tmp_path):
+    """Same per-case scores as baseline and current → gate must NOT fire."""
+    prompts = {f"q{i}": [1.0 if i % 3 else 0.0] for i in range(8)}
+    path, per_case = _build_baseline(tmp_path, prompts)
+    # Current is identical to baseline.
+    regressed, msgs = compare_to_baseline(
+        aggregate_per_case(per_case), path, current_per_case=per_case,
+    )
+    assert regressed is False
+    assert any("paired gate" in m for m in msgs)
+    assert any("overall" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_compare_paired_clear_regression_fires(tmp_path):
+    """Every case drops pass→fail in current → gate MUST fire."""
+    from evals.runner import PerCaseResult
+    prompts = {f"q{i}": [1.0] for i in range(8)}
+    path, base_per_case = _build_baseline(tmp_path, prompts)
+    # Current: same case ids, all failing now.
+    current = [
+        PerCaseResult(
+            case=pc.case, id=pc.id, tag=pc.tag, prompt=pc.prompt,
+            scores=[0.0], answers=["x"],
+        )
+        for pc in base_per_case
+    ]
+    cur_agg = aggregate_per_case(current)
+    regressed, msgs = compare_to_baseline(cur_agg, path, current_per_case=current)
+    assert regressed is True
+    assert any("REGRESSION" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_compare_legacy_baseline_falls_back_with_warning(tmp_path, caplog):
+    """A v1 baseline (no per-case data) uses the pp path even if current has
+    per-case data — and logs that it predates paired gating."""
+    import logging
+    from evals.runner import PerCaseResult
+    legacy = tmp_path / "legacy.json"
+    save_baseline({"math": {"n": 4, "mean_score": 0.9, "pass_rate": 1.0}}, legacy)
+    current = [
+        PerCaseResult(
+            case=EvalCase(prompt=f"q{i}", tag="math"),
+            id=case_id("math", f"q{i}"), tag="math", prompt=f"q{i}",
+            scores=[0.0], answers=["x"],
+        )
+        for i in range(4)
+    ]
+    with caplog.at_level(logging.WARNING):
+        regressed, msgs = compare_to_baseline(
+            aggregate_per_case(current), legacy, current_per_case=current,
+        )
+    # pass_rate 0% vs baseline 100% → -100pp → regression on the legacy gate.
+    assert regressed is True
+    assert any("predates paired gating" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Abstention capture via the event bus + separation (Part C)
+# --------------------------------------------------------------------------- #
+
+
+class _EventRouter:
+    """Stub fleet-like router with an event bus. ask() emits a
+    ResponseSynthesized carrying a per-prompt (winner_score, abstain), exactly
+    as the real router does on the verifier path — so the harness can capture
+    calibration signal without Ollama."""
+
+    def __init__(self, plan: dict):
+        from fleet.events import EventBus
+        self._events = EventBus()
+        self._plan = plan  # prompt -> (answer, winner_score, abstain)
+
+    async def ask(self, prompt: str):
+        from fleet.events import ResponseSynthesized
+        answer, winner_score, abstain = self._plan[prompt]
+        self._events.emit(ResponseSynthesized(
+            tag="math", mode="verifier",
+            winner_model=None if abstain else "m",
+            winner_score=winner_score, abstain=abstain,
+        ))
+        return answer
+
+
+@pytest.mark.asyncio
+async def test_run_eval_detailed_captures_winner_score_and_abstain():
+    cases = [
+        EvalCase(prompt="ans", tag="math", expected=42),
+        EvalCase(prompt="abs", tag="math", expected=42),
+    ]
+    router = _EventRouter({
+        "ans": ("answer 0", 0.45, False),          # answered, wrong
+        "abs": ("the answer is 42", None, True),    # abstained (dump happens to contain 42)
+    })
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()})
+    by_prompt = {pc.prompt: pc for pc in per_case}
+    assert by_prompt["ans"].winner_scores == [0.45]
+    assert by_prompt["ans"].abstained == [False]
+    assert by_prompt["abs"].winner_scores == [None]
+    assert by_prompt["abs"].abstained == [True]
+
+
+@pytest.mark.asyncio
+async def test_abstained_dump_not_counted_in_selective_accuracy():
+    """The key fix: an abstained case whose dump string accidentally SCORES AS
+    PASS must not inflate selective accuracy. Legacy pass_rate still counts it
+    (unchanged), but selective_accuracy is measured over answered only."""
+    cases = [
+        EvalCase(prompt="ans", tag="math", expected=42),
+        EvalCase(prompt="abs", tag="math", expected=42),
+    ]
+    router = _EventRouter({
+        "ans": ("answer 0", 0.45, False),         # answered + WRONG
+        "abs": ("the answer is 42", None, True),  # abstained + dump scores PASS
+    })
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()})
+    agg = aggregate_per_case(per_case)["math"]
+    # Legacy keys unchanged: the abstained dump's pass still shows up here.
+    assert agg["pass_rate"] == 0.5
+    # Calibration view excludes the abstention entirely.
+    assert agg["answered"] == 1
+    assert agg["abstained"] == 1
+    assert agg["coverage"] == 0.5
+    assert agg["abstention_rate"] == 0.5
+    assert agg["selective_accuracy"] == 0.0  # the one answered case was wrong
+
+
+@pytest.mark.asyncio
+async def test_stub_router_without_events_degrades_gracefully():
+    """A non-fleet stub (no _events) records no calibration data: everything
+    counts as answered, so legacy behavior is preserved exactly."""
+    cases = [EvalCase(prompt="math1", tag="math", expected=42)]
+    router = _StubRouter({"math1": "answer 42"})
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()})
+    pc = per_case[0]
+    assert pc.winner_scores == [None]
+    assert pc.abstained == [False]
+    agg = aggregate_per_case(per_case)["math"]
+    assert agg["coverage"] == 1.0
+    assert agg["abstention_rate"] == 0.0
+    assert agg["selective_accuracy"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_calibration_records_adapter_flattens_repeats():
+    from evals.runner import calibration_records
+    cases = [EvalCase(prompt="ans", tag="math", expected=42)]
+    router = _EventRouter({"ans": ("answer 42", 0.8, False)})
+    per_case = await run_eval_detailed(router, cases, {"math": NumericMatchScorer()}, repeats=2)
+    recs = calibration_records(per_case)
+    assert len(recs) == 2
+    assert all(r.tag == "math" and r.winner_score == 0.8 for r in recs)
+    assert all(r.correct and not r.abstained for r in recs)
+    # Answered rows carry a real correctness measurement.
+    assert all(r.correct_known for r in recs)
+
+
+@pytest.mark.asyncio
+async def test_calibration_records_marks_live_abstentions_unknown():
+    """FIX 3: live abstained rows are flagged correct_known=False, so
+    calibrate() reports abstention_precision as 'not measured' rather than a
+    fabricated ~1.0 derived from the abstention-dump string's score."""
+    from evals.runner import calibration_records
+    from evals.calibrate import calibrate
+
+    cases = [EvalCase(prompt="abs", tag="math", expected=42)]
+    # Abstention dump happens to contain "42" so the scorer would mark it
+    # "correct" — exactly the misleading signal we must NOT feed as precision.
+    router = _EventRouter({"abs": ("the answer is 42", None, True)})
+    per_case = await run_eval_detailed(
+        router, cases, {"math": NumericMatchScorer()}, repeats=3
+    )
+    recs = calibration_records(per_case)
+    assert len(recs) == 3
+    abstained = [r for r in recs if r.abstained]
+    assert len(abstained) == 3
+    # Abstained rows are flagged unknown despite the dump scoring as "correct".
+    assert all(not r.correct_known for r in abstained)
+
+    tc = calibrate(recs).per_tag["math"]
+    assert tc.n_abstained == 3
+    assert tc.abstention_precision is None
+    assert tc.abstention_precision_display() == "n/a (not measured on live eval data)"
+
+
+@pytest.mark.asyncio
+async def test_run_and_report_threads_repeats_and_reports_significance(tmp_path):
+    # Fixtures
+    f = tmp_path / "math.jsonl"
+    f.write_text(
+        '{"prompt": "1+1?", "tag": "math", "expected": 2}\n'
+        '{"prompt": "2+2?", "tag": "math", "expected": 4}\n'
+    )
+    router = _StubRouter({"1+1?": "answer 2", "2+2?": "answer 4"})
+    from evals.runner import run_and_report
+
+    # First run: no baseline yet → save one with per-case data.
+    report = await run_and_report(router, tmp_path, repeats=3)
+    assert report["repeats"] == 3
+    assert len(report["per_case"]) == 2
+    assert all(len(pc["scores"]) == 3 for pc in report["per_case"])
+
+    baseline = tmp_path / "baseline.json"
+    save_baseline(
+        aggregate_per_case(
+            await run_eval_detailed(router, load_fixtures(tmp_path), repeats=3)
+        ),
+        baseline,
+        per_case=await run_eval_detailed(router, load_fixtures(tmp_path), repeats=3),
+    )
+    report2 = await run_and_report(router, tmp_path, baseline, repeats=3)
+    assert report2["gating_method"] == "paired"
+    assert report2["regressed"] is False
+    assert "significance" in report2
+    assert "__overall__" in report2["significance"]

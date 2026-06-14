@@ -22,7 +22,7 @@ import os
 import random
 import threading
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +36,26 @@ class ThompsonBandit:
         prior_alpha: float = 1.0,
         prior_beta: float = 1.0,
         save_every: int = 25,
+        decay: float = 1.0,
+        prior_provider: Optional[Callable[[str, str], tuple[float, float]]] = None,
     ):
         # Expand ~ so configs like "~/.fleet/bandit.json" Just Work.
         self._state_path = os.path.expanduser(state_path) if state_path else None
         self._prior_alpha = prior_alpha
         self._prior_beta = prior_beta
+        # Exponential forgetting factor in (0, 1]. 1.0 = no decay (exact
+        # historical behavior). <1.0 shrinks the learned excess over the
+        # prior toward the prior before each new observation, so stale
+        # evidence (e.g. a since-upgraded cloud model under the same tag)
+        # fades. Out-of-range values fall back to 1.0 (no decay).
+        self._decay = decay if 0.0 < decay <= 1.0 else 1.0
+        # Optional per-arm prior seeder: (tag, model) -> (alpha, beta), used
+        # ONLY when an arm is first created. Lets the router seed a mild
+        # priority-biased prior at cold start. None = uniform prior for every
+        # arm (historical behavior). MUST be cheap and side-effect-free: it is
+        # invoked while self._lock is held (a non-reentrant Lock), so it must
+        # not call back into this bandit or it will deadlock.
+        self._prior_provider = prior_provider
         self._state: dict[str, dict[str, list[float]]] = {}
         self._lock = threading.Lock()
         # Separate lock so the (potentially slow) disk write doesn't block
@@ -58,12 +73,25 @@ class ThompsonBandit:
     def _key(self, tag: str, model: str) -> tuple[str, str]:
         return tag, model
 
+    def _arm_prior(self, tag: str, model: str) -> tuple[float, float]:
+        """Baseline prior for an arm. The prior_provider seeds it when set
+        (used both to initialize unseen arms and as the target that decay
+        shrinks toward); otherwise the uniform (prior_alpha, prior_beta).
+
+        Deterministic and side-effect-free — safe to call repeatedly and
+        while holding self._lock. The provider is read-only over config, so
+        a seeded arm always decays back toward its OWN seed, not uniform."""
+        if self._prior_provider is not None:
+            a, b = self._prior_provider(tag, model)
+            return float(a), float(b)
+        return self._prior_alpha, self._prior_beta
+
     def _params(self, tag: str, model: str) -> tuple[float, float]:
         with self._lock:
             tag_state = self._state.setdefault(tag, {})
             ab = tag_state.get(model)
             if ab is None:
-                ab = [self._prior_alpha, self._prior_beta]
+                ab = list(self._arm_prior(tag, model))
                 tag_state[model] = ab
             return ab[0], ab[1]
 
@@ -96,15 +124,27 @@ class ThompsonBandit:
     def update(self, tag: str, model: str, reward: float) -> None:
         """Update posterior. Reward ∈ [0, 1]. Treats reward as a Bernoulli
         outcome with that probability — fractional rewards split into
-        partial alpha/beta updates. Writes are debounced — see save_every."""
+        partial alpha/beta updates. Writes are debounced — see save_every.
+
+        Order of operations per call:
+        1. Unseen arm → initialize from the prior_provider (or uniform).
+        2. Recency decay: shrink the learned excess over the arm's prior
+           toward that prior by `decay` (skipped when decay == 1.0, which
+           keeps the math byte-identical to the no-decay path).
+        3. Add the new observation.
+        """
         reward = max(0.0, min(1.0, float(reward)))
         should_save = False
         with self._lock:
             tag_state = self._state.setdefault(tag, {})
             ab = tag_state.get(model)
             if ab is None:
-                ab = [self._prior_alpha, self._prior_beta]
+                ab = list(self._arm_prior(tag, model))
                 tag_state[model] = ab
+            if self._decay < 1.0:
+                pa, pb = self._arm_prior(tag, model)
+                ab[0] = pa + (ab[0] - pa) * self._decay
+                ab[1] = pb + (ab[1] - pb) * self._decay
             ab[0] += reward
             ab[1] += 1.0 - reward
             self._pending_writes += 1
