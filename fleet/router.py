@@ -237,6 +237,10 @@ class FleetRouter:
         force_model: str | None = None,
         system: str | None = None,
     ) -> str | dict[str, str]:
+        # Config-level default system prompt: use it when the caller didn't
+        # provide one and the config has a non-empty default.
+        if system is None and self._config.system_prompt:
+            system = self._config.system_prompt
         if force_model:
             responses = await self._dispatcher.run(prompt, [force_model], system=system)
             result = responses.get(force_model)

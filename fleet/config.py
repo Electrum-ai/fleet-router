@@ -201,6 +201,9 @@ class Config:
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     bandit: BanditConfig = field(default_factory=BanditConfig)
+    # Default system prompt injected into every request unless the caller
+    # overrides it. Empty string = no system prompt (backward compat).
+    system_prompt: str = ""
 
 
 def clean_model_key(key: str) -> str:
@@ -464,4 +467,5 @@ def load_config(path: Path | str | None = None) -> Config:
         escalation=escalation,
         retrieval=retrieval,
         bandit=bandit,
+        system_prompt=str(raw.get("system_prompt", "") or "") if isinstance(raw.get("system_prompt"), str) else "",
     )

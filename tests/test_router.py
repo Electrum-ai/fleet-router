@@ -118,6 +118,38 @@ async def test_system_prompt_forwarded(router):
 
 
 @pytest.mark.asyncio
+async def test_system_prompt_from_config_when_caller_omits():
+    """When the caller passes system=None, the config-level default is used."""
+    cfg = Config()
+    cfg.system_prompt = "You are a research agent."
+    router = FleetRouter(cfg)
+    with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
+         patch.object(router._registry, "get_best_for_tag", return_value="model"), \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_dispatch:
+        mock_dispatch.return_value = {"model": "result"}
+
+        result = await router.ask("prompt")
+        assert result == "result"
+        assert mock_dispatch.call_args.kwargs["system"] == "You are a research agent."
+
+
+@pytest.mark.asyncio
+async def test_caller_system_overrides_config_default():
+    """An explicit system= arg takes precedence over the config default."""
+    cfg = Config()
+    cfg.system_prompt = "You are a research agent."
+    router = FleetRouter(cfg)
+    with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
+         patch.object(router._registry, "get_best_for_tag", return_value="model"), \
+         patch.object(router._dispatcher, "run", new_callable=AsyncMock) as mock_dispatch:
+        mock_dispatch.return_value = {"model": "result"}
+
+        result = await router.ask("prompt", system="Override prompt")
+        assert result == "result"
+        assert mock_dispatch.call_args.kwargs["system"] == "Override prompt"
+
+
+@pytest.mark.asyncio
 async def test_empty_string_response_not_treated_as_failure(router):
     with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
          patch.object(router._registry, "get_best_for_tag", return_value="model"), \

@@ -389,3 +389,31 @@ synthesis:
     config_path.write_text(yaml_text)
     cfg = load_config(config_path)
     assert cfg.synthesis.abstention_thresholds == {}
+
+
+def test_system_prompt_loaded_from_yaml(tmp_path):
+    yaml_text = """
+system_prompt: |
+  You are a research agent.
+  Follow best practices.
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert "research agent" in cfg.system_prompt
+    assert "best practices" in cfg.system_prompt
+
+
+def test_system_prompt_defaults_empty():
+    cfg = Config()
+    assert cfg.system_prompt == ""
+
+
+def test_system_prompt_non_string_ignored(tmp_path):
+    yaml_text = """
+system_prompt: 42
+"""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_text)
+    cfg = load_config(config_path)
+    assert cfg.system_prompt == ""
