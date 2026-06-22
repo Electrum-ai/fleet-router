@@ -10,19 +10,52 @@ ollama:
   # api_key: ""  # set when Ollama requires authentication (e.g. cloud models)
 
 models:
-  deepseek-v4-pro:
-    tags: [code, reasoning, math]
+  # ── Primary models (cloud) ──────────────────────────────────────
+  # Kimi K2.7 — general default, broad coverage, long-horizon tasks
+  kimi-k2.7:
+    tags: [general, reasoning, long_context]
     priority: 1
     class: reasoning
-  glm-5.1:
-    tags: [creative, chinese, long_context]
+    api_model: kimi-k2.7:cloud
+
+  # GLM 5.2 — Z.ai flagship, 1M context, engineering, creative, Chinese
+  glm-5.2:
+    tags: [creative, chinese, long_context, code, reasoning]
     priority: 2
-  minimax-m2.7:
-    tags: [summarize, dialogue]
+    class: reasoning
+    api_model: glm-5.2:cloud
+
+  # DeepSeek V4 Pro — code, reasoning, math (strongest reasoner)
+  deepseek-v4-pro:
+    tags: [code, reasoning, math]
     priority: 3
+    class: reasoning
+    api_model: deepseek-v4-pro:cloud
+
+  # Kimi K2.7 Code — coding-focused agentic model
+  kimi-k2.7-code:
+    tags: [code]
+    priority: 4
+    class: reasoning
+    api_model: kimi-k2.7-code:cloud
+
+  # Qwen 3.5 — agentic coding, thinking preservation (3.6 has no cloud tag yet)
+  qwen3.5:
+    tags: [code, reasoning, general]
+    priority: 5
+    api_model: qwen3.5:cloud
+
+  # Gemma 4 — vision/multimodal, 256K context
+  gemma4:
+    tags: [general, summarize, reasoning]
+    priority: 6
+    api_model: gemma4:31b-cloud
+
+  # DeepSeek V4 Flash — fast drafts
   deepseek-v4-flash:
     tags: [code, general]
-    priority: 4
+    priority: 7
+    api_model: deepseek-v4-flash:cloud
 
 thresholds:
   # 1.01 means classification confidence can never clear the bar →
@@ -38,7 +71,7 @@ classifier:
 synthesis:
   mode: verifier
   # Strongest model arbitrates judge-based tags (reasoning, creative, …).
-  judge_model: deepseek-v4-pro
+  judge_model: glm-5.2
   abstention_threshold: 0.4
   # Per-tag overrides for the abstention cut-point. Verifier score scales are
   # INCOMMENSURABLE across tags (judge x/10 → [0,1], math agreement fractions,
@@ -71,11 +104,11 @@ sampling:
 
 refinement:
   enabled: true
-  critique_model: deepseek-v4-pro
+  critique_model: glm-5.2
 
 escalation:
   enabled: true
-  model: deepseek-v4-pro
+  model: glm-5.2
   score_threshold: 0.6
 
 retrieval:

@@ -259,11 +259,13 @@ This project routes **only to open-source LLMs running on Ollama** (local or `:c
 
 | Model | Best For | Ollama Tag | Priority |
 |:------|:---------|:-----------|:--------:|
-| 🌟 **Kimi K2.7** | General default — broad coverage | `kimi-k2.7:cloud` | 1 |
-| 🔥 **DeepSeek V4 Pro** | Code, reasoning, math | `deepseek-v4-pro:cloud` | 2 |
-| ✍️ **GLM 5.1** | Creative writing, Chinese, long context | `glm-5.1:cloud` | 3 |
-| 📋 **MiniMax 2.7** | Summarization, dialogue | `minimax-m2.7:cloud` | 4 |
-| ⚡ **DeepSeek V4 Flash** | Fast drafts | `deepseek-v4-flash:cloud` | 5 |
+| 🌟 **Kimi K2.7** | General default — broad coverage, long-horizon | `kimi-k2.7:cloud` | 1 |
+| ✍️ **GLM 5.2** | Creative, Chinese, 1M context, engineering | `glm-5.2:cloud` | 2 |
+| 🔥 **DeepSeek V4 Pro** | Code, reasoning, math (strongest reasoner) | `deepseek-v4-pro:cloud` | 3 |
+| 🤖 **Kimi K2.7 Code** | Coding-focused agentic, long-horizon coding | `kimi-k2.7-code:cloud` | 4 |
+| ⚡ **Qwen 3.5** | Agentic coding, thinking preservation | `qwen3.5:cloud` | 5 |
+| 📷 **Gemma 4** | Vision/multimodal, 256K context | `gemma4:31b-cloud` | 6 |
+| 💨 **DeepSeek V4 Flash** | Fast drafts | `deepseek-v4-flash:cloud` | 7 |
 
 Drop in any other Ollama model — Qwen, Llama, GPT-OSS, etc. — by adding it to `~/.fleet/config.yaml`.
 
