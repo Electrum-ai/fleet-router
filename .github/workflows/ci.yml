@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-${{ runner.os }}-py${{ matrix.python-version }}
+          restore-keys: |
+            hf-models-${{ runner.os }}-
+
+      - name: Run tests
+        env:
+          HF_HOME: ~/.cache/huggingface
+        run: |
+          python -m pytest --tb=short -q
+
+      - name: Eval harness smoke test
+        env:
+          HF_HOME: ~/.cache/huggingface
+        run: |
+          python -c "from evals.runner import load_fixtures; cases = load_fixtures('evals/fixtures/'); print(f'{len(cases)} fixtures loaded OK')"

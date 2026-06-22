@@ -37,7 +37,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-REPO_ROOT = Path("/Users/bistrocloud/fleet-router")
+REPO_ROOT = Path(os.environ.get("FLEET_REPO_ROOT", str(Path.home() / "fleet-router")))
 VENV_FLEET = REPO_ROOT / "venv" / "bin" / "fleet"
 
 PORT = int(os.environ.get("FLEET_PORT", "8765"))

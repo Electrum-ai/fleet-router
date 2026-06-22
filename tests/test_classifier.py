@@ -58,6 +58,7 @@ def test_uncertainty_penalty():
     assert conf < 0.8
 
 
+@pytest.mark.real_embeddings
 def test_embedding_path():
     """Verify the embedding code path actually runs (not the keyword fallback).
 
@@ -71,6 +72,7 @@ def test_embedding_path():
     assert conf > 0.0
 
 
+@pytest.mark.real_embeddings
 def test_embedding_fallback_on_import_error():
     original_import = __builtins__["__import__"]
 

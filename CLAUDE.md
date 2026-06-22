@@ -117,7 +117,7 @@ windows still use Anthropic.
 ## Rollback
 
 - Disable the slash command: `rm ~/.claude/skills/fleet/SKILL.md`
-- Disable the auto-start: `rm /Users/bistrocloud/fleet-router/.claude/settings.json`
+- Disable the auto-start: `rm $HOME/fleet-router/.claude/settings.json`
 - Stop the proxy: `kill $(cat ~/.fleet/run/fleet-proxy.pid)` or
   `fleet-off` if the toggle is sourced.
 

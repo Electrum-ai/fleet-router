@@ -120,7 +120,11 @@ async def test_system_prompt_forwarded(router):
 @pytest.mark.asyncio
 async def test_system_prompt_from_config_when_caller_omits():
     """When the caller passes system=None, the config-level default is used."""
-    cfg = Config()
+    cfg = Config(
+        thresholds=ThresholdConfig(single_confidence=0.8),
+        sampling=SamplingConfig(samples_by_tag={"default": 1}),
+        synthesis=SynthesisConfig(mode="heuristic"),
+    )
     cfg.system_prompt = "You are a research agent."
     router = FleetRouter(cfg)
     with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
@@ -136,7 +140,11 @@ async def test_system_prompt_from_config_when_caller_omits():
 @pytest.mark.asyncio
 async def test_caller_system_overrides_config_default():
     """An explicit system= arg takes precedence over the config default."""
-    cfg = Config()
+    cfg = Config(
+        thresholds=ThresholdConfig(single_confidence=0.8),
+        sampling=SamplingConfig(samples_by_tag={"default": 1}),
+        synthesis=SynthesisConfig(mode="heuristic"),
+    )
     cfg.system_prompt = "You are a research agent."
     router = FleetRouter(cfg)
     with patch.object(router._classifier, "classify", return_value=("code", 0.95)), \
